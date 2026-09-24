@@ -1,25 +1,25 @@
 """
-Streamlit-applicatie voor het omrekenen van drukloggergegevens naar
-grondwaterstanden ten opzichte van NAP.
+Streamlit-applicatie voor het omrekenen van loggerdata naar waterstanden
+ten opzichte van NAP.
 
-De applicatie ondersteunt:
+Ondersteunde loggerbestanden:
+- CSV, TXT en tekstuele DAT-bestanden;
+- UTF-8, Windows-1252, Latin-1 en UTF-16;
+- generieke binaire DAT-bestanden met vaste recordstructuur.
 
-1. Absolute druklogger met atmosferische compensatie.
-2. Logger die al een waterkolom registreert.
-3. Verschillende scheidingstekens, decimalen en tekstcoderingen.
-4. Interpolatie van lokale KNMI-luchtdruk naar logger-tijdstippen.
-5. Correctie voor temperatuurafhankelijke waterdichtheid.
-6. Tijdzonecorrectie voor UTC en lokale Nederlandse tijd.
-7. Kwaliteitscontrole en export naar CSV.
+De decoder voor binaire bestanden ondersteunt:
+- configureerbare headerlengte;
+- configureerbare recordlengte;
+- little-endian en big-endian;
+- Unix-tijdstempels;
+- Excel-datums;
+- losse datumvelden;
+- integers, float32 en float64;
+- schaalfactoren en offsets.
 
-Berekening bij een absolute-druklogger:
-
-    sensor_hoogte_nap = bovenkant_peilbuis_nap - kabellengte
-    waterkolom = (loggerdruk_absoluut - luchtdruk) / (rho * g)
-    waterstand_nap = sensor_hoogte_nap + waterkolom
-
-De gebruikte kabellengte moet worden gemeten van de bovenkant van de
-peilbuis tot het drukpunt of sensormembraan van de logger.
+Let op:
+Een DAT-extensie definieert geen vast bestandsformaat. Fabrikanten kunnen
+een propriëtair, gecomprimeerd of versleuteld formaat gebruiken.
 """
 
 from __future__ import annotations
@@ -28,8 +28,9 @@ import io
 import logging
 import math
 import re
+import struct
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Final, Literal
 
 import numpy as np
@@ -38,49 +39,15 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-# ============================================================================
+# =============================================================================
 # Configuratie
-# ============================================================================
+# =============================================================================
 
-APP_TITLE: Final[str] = "Grondwaterstand naar NAP"
-GRAVITY: Final[float] = 9.80665
-DEFAULT_WATER_DENSITY: Final[float] = 998.2
-MAX_FILE_SIZE_MB: Final[int] = 100
-
-DATETIME_COLUMN_HINTS: Final[tuple[str, ...]] = (
-    "datetime",
-    "date time",
-    "timestamp",
-    "tijdstip",
-    "datumtijd",
-    "datum tijd",
-    "date",
-    "datum",
-    "time",
-    "tijd",
-)
-
-PRESSURE_COLUMN_HINTS: Final[tuple[str, ...]] = (
-    "pressure",
-    "druk",
-    "press",
-    "p abs",
-    "p_abs",
-    "absolute pressure",
-    "luchtdruk",
-    "barometer",
-    "barometric",
-    "p",
-)
-
-TEMPERATURE_COLUMN_HINTS: Final[tuple[str, ...]] = (
-    "temperature",
-    "temperatuur",
-    "temp",
-    "water temperature",
-    "watertemperatuur",
-    "t",
-)
+APP_TITLE: Final[str] = "Waterstanden naar NAP"
+GRAVITY_M_S2: Final[float] = 9.80665
+DEFAULT_WATER_DENSITY_KG_M3: Final[float] = 998.2
+MAX_FILE_SIZE_MB: Final[int] = 200
+NANOSECONDS_PER_HOUR: Final[int] = 3_600_000_000_000
 
 LOGGER_MODES: Final[dict[str, str]] = {
     "Absolute druk": "absolute_pressure",
@@ -95,8 +62,8 @@ PRESSURE_UNIT_FACTORS_TO_PA: Final[dict[str, float]] = {
     "kPa": 1_000.0,
     "bar": 100_000.0,
     "psi": 6_894.757293168,
-    "mH₂O": DEFAULT_WATER_DENSITY * GRAVITY,
-    "cmH₂O": DEFAULT_WATER_DENSITY * GRAVITY / 100.0,
+    "mH2O": DEFAULT_WATER_DENSITY_KG_M3 * GRAVITY_M_S2,
+    "cmH2O": DEFAULT_WATER_DENSITY_KG_M3 * GRAVITY_M_S2 / 100.0,
 }
 
 LENGTH_UNIT_FACTORS_TO_M: Final[dict[str, float]] = {
@@ -105,15 +72,28 @@ LENGTH_UNIT_FACTORS_TO_M: Final[dict[str, float]] = {
     "mm": 0.001,
 }
 
-DATETIME_FORMAT_OPTIONS: Final[dict[str, str | None]] = {
-    "Automatisch herkennen": None,
-    "DD-MM-YYYY HH:MM:SS": "%d-%m-%Y %H:%M:%S",
-    "DD/MM/YYYY HH:MM:SS": "%d/%m/%Y %H:%M:%S",
-    "YYYY-MM-DD HH:MM:SS": "%Y-%m-%d %H:%M:%S",
-    "YYYY/MM/DD HH:MM:SS": "%Y/%m/%d %H:%M:%S",
-    "YYYYMMDDHHMM": "%Y%m%d%H%M",
-    "YYYYMMDDHH": "%Y%m%d%H",
+BINARY_VALUE_FORMATS: Final[dict[str, tuple[str, int]]] = {
+    "Signed integer 8-bit": ("b", 1),
+    "Unsigned integer 8-bit": ("B", 1),
+    "Signed integer 16-bit": ("h", 2),
+    "Unsigned integer 16-bit": ("H", 2),
+    "Signed integer 32-bit": ("i", 4),
+    "Unsigned integer 32-bit": ("I", 4),
+    "Signed integer 64-bit": ("q", 8),
+    "Unsigned integer 64-bit": ("Q", 8),
+    "Float 32-bit": ("f", 4),
+    "Float 64-bit": ("d", 8),
 }
+
+TEXT_ENCODINGS: Final[tuple[str, ...]] = (
+    "utf-8-sig",
+    "utf-8",
+    "utf-16",
+    "utf-16-le",
+    "utf-16-be",
+    "cp1252",
+    "latin-1",
+)
 
 TimezoneMode = Literal[
     "Nederlandse lokale tijd",
@@ -122,9 +102,9 @@ TimezoneMode = Literal[
 ]
 
 
-# ============================================================================
+# =============================================================================
 # Logging
-# ============================================================================
+# =============================================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,354 +113,144 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 
 
-# ============================================================================
+# =============================================================================
 # Datamodellen
-# ============================================================================
+# =============================================================================
 
 @dataclass(frozen=True)
 class PeilfilterConfiguration:
-    """Configuratie van een peilfilter en de daarin geplaatste logger."""
+    """Configuratie voor de hydrologische berekening."""
 
     filter_id: str
     top_casing_nap_m: float
     cable_length_m: float
     logger_mode: str
-    logger_pressure_unit: str
+    logger_unit: str
     knmi_pressure_unit: str
-    water_column_unit: str = "m"
-    default_water_temperature_c: float = 20.0
-    use_temperature_density: bool = True
+    default_temperature_c: float
+    use_temperature_density: bool
 
     @property
     def sensor_elevation_nap_m(self) -> float:
-        """Bereken de hoogte van de druksensor ten opzichte van NAP."""
+        """Hoogte van het druksensormembraan ten opzichte van NAP."""
         return self.top_casing_nap_m - self.cable_length_m
 
 
 @dataclass(frozen=True)
-class DataQualitySummary:
-    """Samenvatting van de uitgevoerde kwaliteitscontrole."""
+class BinaryFieldDefinition:
+    """Definitie van één numeriek veld in een binair record."""
 
-    total_rows: int
-    valid_rows: int
-    missing_logger_values: int
-    missing_knmi_values: int
-    negative_water_columns: int
-    extrapolated_rows: int
-    implausible_rows: int
+    offset: int
+    data_type: str
+    scale: float = 1.0
+    value_offset: float = 0.0
 
 
-# ============================================================================
-# Bestandsverwerking
-# ============================================================================
+@dataclass(frozen=True)
+class BinaryDecoderConfiguration:
+    """Configuratie voor een binair bestand met records van vaste lengte."""
 
-def decode_file(file_bytes: bytes) -> str:
-    """
-    Decodeer een tekstbestand met een aantal gebruikelijke coderingen.
+    header_size: int
+    record_size: int
+    byte_order: str
+    timestamp_mode: str
+    timestamp_offset: int
+    timestamp_data_type: str
+    timestamp_unit: str
+    timestamp_origin: datetime
+    pressure_field: BinaryFieldDefinition
+    temperature_field: BinaryFieldDefinition | None
+    year_offset: int = 0
+    month_offset: int = 2
+    day_offset: int = 3
+    hour_offset: int = 4
+    minute_offset: int = 5
+    second_offset: int = 6
+    year_data_type: str = "Unsigned integer 16-bit"
 
-    Raises:
-        ValueError: Als geen ondersteunde codering werkt.
-    """
-    encodings = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
 
-    for encoding in encodings:
-        try:
-            return file_bytes.decode(encoding)
-        except UnicodeDecodeError:
-            continue
+# =============================================================================
+# Algemene hulpfuncties
+# =============================================================================
 
-    raise ValueError(
-        "Het bestand kon niet als tekst worden gelezen. "
-        "Sla het bestand op als UTF-8, Windows-1252 of Latin-1."
+def water_density_kg_m3(temperature_c: pd.Series) -> pd.Series:
+    """Bereken de dichtheid van zoet water op basis van temperatuur."""
+    temperature = temperature_c.clip(lower=0.0, upper=40.0)
+
+    numerator = (
+        (temperature + 288.9414)
+        * (temperature - 3.9863) ** 2
     )
+    denominator = 508_929.2 * (temperature + 68.12963)
+
+    return 1_000.0 * (1.0 - numerator / denominator)
 
 
-def remove_comment_and_metadata_lines(text: str) -> str:
-    """
-    Verwijder lege regels en veelvoorkomende metadataregels.
+def pressure_to_pa(values: pd.Series, unit: str) -> pd.Series:
+    """Converteer een drukreeks naar pascal."""
+    if unit not in PRESSURE_UNIT_FACTORS_TO_PA:
+        raise ValueError(f"Onbekende drukeenheid: {unit}")
 
-    Een kommentaarregel begint met #, // of !. Regels voor de daadwerkelijke
-    tabelkop worden alleen verwijderd als ze duidelijk geen tabelstructuur
-    bevatten.
-    """
-    lines = text.splitlines()
-    cleaned_lines: list[str] = []
-
-    for line in lines:
-        stripped = line.strip()
-
-        if not stripped:
-            continue
-
-        if stripped.startswith(("#", "//", "!")):
-            continue
-
-        cleaned_lines.append(line)
-
-    return "\n".join(cleaned_lines)
+    return values * PRESSURE_UNIT_FACTORS_TO_PA[unit]
 
 
-def detect_separator(text: str) -> str:
-    """
-    Detecteer het meest waarschijnlijke scheidingsteken.
+def length_to_m(values: pd.Series, unit: str) -> pd.Series:
+    """Converteer een lengtereeks naar meter."""
+    if unit not in LENGTH_UNIT_FACTORS_TO_M:
+        raise ValueError(f"Onbekende lengte-eenheid: {unit}")
 
-    Ondersteunde scheidingstekens:
-    - puntkomma
-    - tab
-    - komma
-    - pipe
-    """
-    candidate_lines = [
-        line
-        for line in text.splitlines()
-        if line.strip() and not line.lstrip().startswith(("#", "//", "!"))
-    ]
+    return values * LENGTH_UNIT_FACTORS_TO_M[unit]
 
-    if not candidate_lines:
-        raise ValueError("Het bestand bevat geen leesbare gegevens.")
-
-    sample_lines = candidate_lines[:20]
-    candidates = (";", "\t", ",", "|")
-
-    scores: dict[str, float] = {}
-
-    for separator in candidates:
-        counts = [line.count(separator) for line in sample_lines]
-        nonzero_counts = [count for count in counts if count > 0]
-
-        if not nonzero_counts:
-            scores[separator] = -1.0
-            continue
-
-        mean_count = float(np.mean(nonzero_counts))
-        variability = float(np.std(nonzero_counts))
-        coverage = len(nonzero_counts) / len(sample_lines)
-
-        scores[separator] = coverage * 10.0 + mean_count - variability
-
-    detected = max(scores, key=scores.get)
-
-    if scores[detected] < 0:
-        return r"\s+"
-
-    return detected
-
-
-def find_probable_header_row(text: str, separator: str) -> int:
-    """
-    Zoek de meest waarschijnlijke tabelkop.
-
-    Dit helpt bij DAT- en KNMI-bestanden die enkele metadataregels boven de
-    kolomnamen bevatten.
-    """
-    lines = text.splitlines()
-    best_row = 0
-    best_score = -math.inf
-
-    for index, line in enumerate(lines[:100]):
-        stripped = line.strip()
-
-        if not stripped:
-            continue
-
-        if separator == r"\s+":
-            parts = re.split(r"\s+", stripped)
-        else:
-            parts = [part.strip() for part in stripped.split(separator)]
-
-        if len(parts) < 2:
-            continue
-
-        letters = sum(
-            bool(re.search(r"[A-Za-zÀ-ÿ]", part))
-            for part in parts
-        )
-        unique_parts = len(set(parts))
-        unnamed_parts = sum(not part for part in parts)
-
-        score = (
-            len(parts)
-            + letters * 2
-            + unique_parts * 0.2
-            - unnamed_parts * 2
-        )
-
-        lower_line = stripped.lower()
-
-        if any(hint in lower_line for hint in DATETIME_COLUMN_HINTS):
-            score += 5
-
-        if any(hint in lower_line for hint in PRESSURE_COLUMN_HINTS):
-            score += 5
-
-        if score > best_score:
-            best_score = score
-            best_row = index
-
-    return best_row
-
-
-def normalize_column_names(dataframe: pd.DataFrame) -> pd.DataFrame:
-    """Maak kolomnamen uniek en verwijder overtollige spaties."""
-    result = dataframe.copy()
-    new_columns: list[str] = []
-    seen: dict[str, int] = {}
-
-    for column in result.columns:
-        name = str(column).strip()
-        name = re.sub(r"\s+", " ", name)
-        name = name or "kolom"
-
-        count = seen.get(name, 0)
-
-        if count:
-            unique_name = f"{name}_{count + 1}"
-        else:
-            unique_name = name
-
-        seen[name] = count + 1
-        new_columns.append(unique_name)
-
-    result.columns = new_columns
-    return result
-
-
-@st.cache_data(show_spinner=False)
-def read_tabular_file(
-    file_bytes: bytes,
-    separator_option: str,
-    decimal_option: str,
-    skip_rows: int,
-) -> pd.DataFrame:
-    """
-    Lees een logger- of KNMI-tekstbestand in als DataFrame.
-
-    Args:
-        file_bytes: Inhoud van het geüploade bestand.
-        separator_option: Gekozen scheidingsteken of 'Automatisch'.
-        decimal_option: Decimaalteken, punt of komma.
-        skip_rows: Aantal regels dat voor de tabel moet worden overgeslagen.
-
-    Returns:
-        Ingelezen DataFrame.
-    """
-    if len(file_bytes) > MAX_FILE_SIZE_MB * 1024 * 1024:
-        raise ValueError(
-            f"Het bestand is groter dan {MAX_FILE_SIZE_MB} MB."
-        )
-
-    text = decode_file(file_bytes)
-    text = remove_comment_and_metadata_lines(text)
-
-    if not text.strip():
-        raise ValueError("Het bestand bevat geen gegevensregels.")
-
-    separator_map = {
-        "Automatisch": None,
-        "Puntkomma": ";",
-        "Tab": "\t",
-        "Komma": ",",
-        "Pipe": "|",
-        "Spaties": r"\s+",
-    }
-
-    separator = separator_map[separator_option]
-
-    if separator is None:
-        separator = detect_separator(text)
-
-    if skip_rows < 0:
-        header_row = find_probable_header_row(text, separator)
-    else:
-        header_row = skip_rows
-
-    try:
-        dataframe = pd.read_csv(
-            io.StringIO(text),
-            sep=separator,
-            header=header_row,
-            decimal=decimal_option,
-            engine="python",
-            dtype=str,
-            on_bad_lines="skip",
-        )
-    except Exception as exc:
-        raise ValueError(
-            "Het bestand kon niet als tabel worden gelezen. "
-            "Controleer het scheidingsteken, het decimaalteken en het aantal "
-            "over te slaan regels."
-        ) from exc
-
-    dataframe = normalize_column_names(dataframe)
-    dataframe = dataframe.dropna(axis=0, how="all")
-    dataframe = dataframe.dropna(axis=1, how="all")
-
-    if dataframe.empty:
-        raise ValueError(
-            "Na het inlezen zijn geen gegevens overgebleven."
-        )
-
-    return dataframe
-
-
-# ============================================================================
-# Conversiehulpfuncties
-# ============================================================================
 
 def clean_numeric_series(series: pd.Series) -> pd.Series:
-    """
-    Converteer een tekstkolom robuust naar numerieke waarden.
-
-    De functie verwerkt onder meer:
-    - decimale komma's;
-    - duizendtallen;
-    - witruimte;
-    - eenheden achter numerieke waarden;
-    - KNMI missings zoals -9999.
-    """
+    """Converteer tekstwaarden robuust naar numerieke waarden."""
     text = series.astype("string").str.strip()
 
-    missing_values = {
-        "",
-        "na",
-        "n/a",
-        "nan",
-        "none",
-        "null",
-        "-9999",
-        "-999.9",
-        "-999",
-    }
-
-    text = text.mask(text.str.lower().isin(missing_values))
+    text = text.mask(
+        text.str.lower().isin(
+            {
+                "",
+                "na",
+                "n/a",
+                "nan",
+                "none",
+                "null",
+                "-999",
+                "-9999",
+                "-999.9",
+            }
+        )
+    )
 
     text = text.str.replace("\u00a0", "", regex=False)
     text = text.str.replace(" ", "", regex=False)
 
-    both_separators = text.str.contains(",", na=False) & text.str.contains(
-        r"\.", na=False
+    both = (
+        text.str.contains(",", na=False)
+        & text.str.contains(r"\.", na=False)
     )
 
-    comma_after_dot = both_separators & (
-        text.str.rfind(",") > text.str.rfind(".")
-    )
+    comma_decimal = both & (text.str.rfind(",") > text.str.rfind("."))
 
     text = text.where(
-        ~comma_after_dot,
+        ~comma_decimal,
         text.str.replace(".", "", regex=False).str.replace(
-            ",", ".", regex=False
+            ",",
+            ".",
+            regex=False,
         ),
     )
 
-    dot_after_comma = both_separators & ~comma_after_dot
+    dot_decimal = both & ~comma_decimal
 
     text = text.where(
-        ~dot_after_comma,
+        ~dot_decimal,
         text.str.replace(",", "", regex=False),
     )
 
-    only_comma = text.str.contains(",", na=False) & ~text.str.contains(
-        r"\.", na=False
+    only_comma = (
+        text.str.contains(",", na=False)
+        & ~text.str.contains(r"\.", na=False)
     )
 
     text = text.where(
@@ -496,50 +266,24 @@ def clean_numeric_series(series: pd.Series) -> pd.Series:
     return pd.to_numeric(extracted, errors="coerce")
 
 
-def parse_datetime_series(
-    dataframe: pd.DataFrame,
-    date_column: str,
-    time_column: str | None,
-    datetime_format: str | None,
-    day_first: bool,
-) -> pd.Series:
-    """
-    Maak één tijdreeks uit een datumkolom en optionele tijdkolom.
-    """
-    if date_column not in dataframe.columns:
-        raise ValueError(f"Datumkolom '{date_column}' bestaat niet.")
+def normalize_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """Normaliseer kolomnamen en maak dubbele namen uniek."""
+    result = dataframe.copy()
+    seen: dict[str, int] = {}
+    normalized: list[str] = []
 
-    date_values = dataframe[date_column].astype("string").str.strip()
+    for column in result.columns:
+        name = re.sub(r"\s+", " ", str(column).strip()) or "kolom"
+        count = seen.get(name, 0)
+        seen[name] = count + 1
 
-    if time_column and time_column != "(geen aparte tijdkolom)":
-        if time_column not in dataframe.columns:
-            raise ValueError(f"Tijdkolom '{time_column}' bestaat niet.")
+        if count:
+            name = f"{name}_{count + 1}"
 
-        time_values = dataframe[time_column].astype("string").str.strip()
-        combined = date_values + " " + time_values
-    else:
-        combined = date_values
+        normalized.append(name)
 
-    try:
-        if datetime_format:
-            parsed = pd.to_datetime(
-                combined,
-                format=datetime_format,
-                errors="coerce",
-            )
-        else:
-            parsed = pd.to_datetime(
-                combined,
-                errors="coerce",
-                dayfirst=day_first,
-                format="mixed",
-            )
-    except (ValueError, TypeError) as exc:
-        raise ValueError(
-            "De datum- en tijdwaarden konden niet worden verwerkt."
-        ) from exc
-
-    return parsed
+    result.columns = normalized
+    return result
 
 
 def localize_datetime_series(
@@ -547,9 +291,10 @@ def localize_datetime_series(
     timezone_mode: TimezoneMode,
 ) -> pd.Series:
     """
-    Zet tijdstempels om naar tijdzone-onafhankelijke Nederlandse lokale tijd.
+    Zet tijdstempels om naar tijdzonevrije Nederlandse lokale tijd.
 
-    Daardoor zijn logger- en KNMI-reeksen goed vergelijkbaar.
+    Bij 'UTC' worden de waarden eerst als UTC geïnterpreteerd en daarna
+    omgerekend naar Europe/Amsterdam.
     """
     parsed = pd.to_datetime(series, errors="coerce")
 
@@ -562,120 +307,609 @@ def localize_datetime_series(
             ambiguous="NaT",
             nonexistent="NaT",
         )
-        return localized.dt.tz_convert("Europe/Amsterdam").dt.tz_localize(None)
+        return localized.dt.tz_convert(
+            "Europe/Amsterdam"
+        ).dt.tz_localize(None)
 
     localized = parsed.dt.tz_localize(
         "Europe/Amsterdam",
         ambiguous="NaT",
         nonexistent="NaT",
     )
+
     return localized.dt.tz_localize(None)
 
 
-def pressure_to_pa(values: pd.Series, unit: str) -> pd.Series:
-    """Converteer drukwaarden naar pascal."""
-    if unit not in PRESSURE_UNIT_FACTORS_TO_PA:
-        raise ValueError(f"Onbekende drukeenheid: {unit}")
+# =============================================================================
+# Detectie tekst of binair
+# =============================================================================
 
-    return values * PRESSURE_UNIT_FACTORS_TO_PA[unit]
-
-
-def length_to_m(values: pd.Series, unit: str) -> pd.Series:
-    """Converteer lengtes naar meter."""
-    if unit not in LENGTH_UNIT_FACTORS_TO_M:
-        raise ValueError(f"Onbekende lengte-eenheid: {unit}")
-
-    return values * LENGTH_UNIT_FACTORS_TO_M[unit]
-
-
-def water_density_kg_m3(temperature_c: pd.Series) -> pd.Series:
+def detect_file_kind(file_bytes: bytes) -> tuple[str, str | None, float]:
     """
-    Bereken de dichtheid van zoet water als functie van de temperatuur.
+    Bepaal of een bestand waarschijnlijk tekst of binair is.
 
-    De formule is geschikt voor normale grondwatertemperaturen en geeft de
-    dichtheid in kg/m³.
+    Returns:
+        Tuple met bestandstype, vermoedelijke encoding en confidence-score.
     """
-    temperature = temperature_c.clip(lower=0.0, upper=40.0)
+    if not file_bytes:
+        raise ValueError("Het geüploade bestand is leeg.")
 
-    numerator = (
-        (temperature + 288.9414)
-        * (temperature - 3.9863) ** 2
-    )
-    denominator = 508_929.2 * (temperature + 68.12963)
+    sample = file_bytes[:65_536]
 
-    return 1_000.0 * (1.0 - numerator / denominator)
+    if sample.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "text", "utf-16", 1.0
+
+    if sample.startswith(b"\xef\xbb\xbf"):
+        return "text", "utf-8-sig", 1.0
+
+    if b"\x00" in sample:
+        even_nulls = sample[0::2].count(0)
+        odd_nulls = sample[1::2].count(0)
+        pairs = max(1, len(sample) // 2)
+
+        if even_nulls / pairs > 0.25:
+            return "text", "utf-16-be", 0.9
+
+        if odd_nulls / pairs > 0.25:
+            return "text", "utf-16-le", 0.9
+
+    for encoding in TEXT_ENCODINGS:
+        try:
+            decoded = sample.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+        if not decoded:
+            continue
+
+        printable = sum(
+            character.isprintable() or character in "\r\n\t"
+            for character in decoded
+        )
+
+        printable_ratio = printable / len(decoded)
+
+        separators = sum(
+            decoded.count(separator)
+            for separator in (";", ",", "\t", "|", "\n")
+        )
+
+        if printable_ratio >= 0.90 and separators >= 2:
+            return "text", encoding, printable_ratio
+
+    return "binary", None, 0.95
 
 
-def detect_suggested_column(
-    columns: list[str],
-    hints: tuple[str, ...],
+def create_hex_preview(
+    file_bytes: bytes,
+    start: int = 0,
+    length: int = 512,
+    bytes_per_line: int = 16,
 ) -> str:
-    """Geef de meest waarschijnlijke kolom op basis van naamherkenning."""
-    lower_columns = [column.lower().strip() for column in columns]
+    """Maak een hexadecimale en ASCII-preview van binaire data."""
+    end = min(len(file_bytes), start + length)
+    data = file_bytes[start:end]
+    lines: list[str] = []
 
-    for hint in hints:
-        for original, lower in zip(columns, lower_columns):
-            if lower == hint:
-                return original
+    for line_start in range(0, len(data), bytes_per_line):
+        chunk = data[line_start:line_start + bytes_per_line]
 
-    for hint in hints:
-        for original, lower in zip(columns, lower_columns):
-            if hint in lower:
-                return original
+        hexadecimal = " ".join(
+            f"{value:02X}"
+            for value in chunk
+        )
 
-    return columns[0]
+        hexadecimal = hexadecimal.ljust(bytes_per_line * 3 - 1)
+
+        ascii_text = "".join(
+            chr(value) if 32 <= value <= 126 else "."
+            for value in chunk
+        )
+
+        absolute_offset = start + line_start
+
+        lines.append(
+            f"{absolute_offset:08X}  {hexadecimal}  |{ascii_text}|"
+        )
+
+    return "\n".join(lines)
 
 
-# ============================================================================
-# Verwerking logger- en KNMI-gegevens
-# ============================================================================
+# =============================================================================
+# Tekstbestanden
+# =============================================================================
 
-def prepare_logger_data(
+def decode_text_file(
+    file_bytes: bytes,
+    preferred_encoding: str | None = None,
+) -> str:
+    """Decodeer een tekstbestand."""
+    encodings = list(TEXT_ENCODINGS)
+
+    if preferred_encoding:
+        encodings = [
+            preferred_encoding,
+            *[
+                encoding
+                for encoding in encodings
+                if encoding != preferred_encoding
+            ],
+        ]
+
+    for encoding in encodings:
+        try:
+            return file_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    raise ValueError(
+        "Het bestand kan niet als tekst worden gelezen. "
+        "Selecteer binaire verwerking."
+    )
+
+
+def detect_separator(text: str) -> str:
+    """Detecteer het meest waarschijnlijke scheidingsteken."""
+    lines = [
+        line
+        for line in text.splitlines()
+        if line.strip()
+    ][:30]
+
+    if not lines:
+        raise ValueError("Geen gegevensregels gevonden.")
+
+    candidates = (";", "\t", ",", "|")
+    scores: dict[str, float] = {}
+
+    for separator in candidates:
+        counts = [line.count(separator) for line in lines]
+        nonzero = [count for count in counts if count > 0]
+
+        if not nonzero:
+            scores[separator] = -1.0
+            continue
+
+        scores[separator] = (
+            len(nonzero) / len(lines) * 10
+            + float(np.mean(nonzero))
+            - float(np.std(nonzero))
+        )
+
+    selected = max(scores, key=scores.get)
+
+    if scores[selected] < 0:
+        return r"\s+"
+
+    return selected
+
+
+def read_text_table(
+    file_bytes: bytes,
+    encoding: str | None,
+    separator_name: str,
+    decimal: str,
+    header_row: int,
+) -> pd.DataFrame:
+    """Lees een tekstueel logger- of KNMI-bestand."""
+    text = decode_text_file(file_bytes, encoding)
+
+    separator_mapping = {
+        "Automatisch": detect_separator(text),
+        "Puntkomma": ";",
+        "Komma": ",",
+        "Tab": "\t",
+        "Pipe": "|",
+        "Spaties": r"\s+",
+    }
+
+    separator = separator_mapping[separator_name]
+
+    try:
+        dataframe = pd.read_csv(
+            io.StringIO(text),
+            sep=separator,
+            decimal=decimal,
+            header=header_row,
+            engine="python",
+            dtype=str,
+            on_bad_lines="skip",
+        )
+    except Exception as exc:
+        raise ValueError(
+            "Het tekstbestand kon niet als tabel worden gelezen."
+        ) from exc
+
+    dataframe = normalize_columns(dataframe)
+    dataframe = dataframe.dropna(axis=0, how="all")
+    dataframe = dataframe.dropna(axis=1, how="all")
+
+    if dataframe.empty:
+        raise ValueError("Het bestand bevat geen bruikbare tabelgegevens.")
+
+    return dataframe
+
+
+# =============================================================================
+# Binaire decoder
+# =============================================================================
+
+def get_binary_format(data_type: str, byte_order: str) -> tuple[str, int]:
+    """Maak een struct-formaat voor een geselecteerd datatype."""
+    if data_type not in BINARY_VALUE_FORMATS:
+        raise ValueError(f"Onbekend binair datatype: {data_type}")
+
+    format_character, size = BINARY_VALUE_FORMATS[data_type]
+    endian_character = "<" if byte_order == "Little-endian" else ">"
+
+    return endian_character + format_character, size
+
+
+def unpack_binary_value(
+    record: bytes,
+    field: BinaryFieldDefinition,
+    byte_order: str,
+) -> float:
+    """Lees een numerieke waarde uit een binair record."""
+    format_string, size = get_binary_format(
+        field.data_type,
+        byte_order,
+    )
+
+    if field.offset < 0 or field.offset + size > len(record):
+        raise ValueError(
+            f"Veld op offset {field.offset} past niet in een record "
+            f"van {len(record)} bytes."
+        )
+
+    raw_value = struct.unpack_from(
+        format_string,
+        record,
+        field.offset,
+    )[0]
+
+    return float(raw_value) * field.scale + field.value_offset
+
+
+def decode_timestamp(
+    record: bytes,
+    configuration: BinaryDecoderConfiguration,
+) -> pd.Timestamp:
+    """Decodeer het tijdstip van één binair record."""
+    mode = configuration.timestamp_mode
+
+    if mode == "Losse datumvelden":
+        year_field = BinaryFieldDefinition(
+            offset=configuration.year_offset,
+            data_type=configuration.year_data_type,
+        )
+
+        year = int(
+            unpack_binary_value(
+                record,
+                year_field,
+                configuration.byte_order,
+            )
+        )
+
+        byte_offsets = (
+            configuration.month_offset,
+            configuration.day_offset,
+            configuration.hour_offset,
+            configuration.minute_offset,
+            configuration.second_offset,
+        )
+
+        values: list[int] = []
+
+        for offset in byte_offsets:
+            if offset < 0 or offset >= len(record):
+                raise ValueError(
+                    f"Datumveld op offset {offset} valt buiten het record."
+                )
+
+            values.append(record[offset])
+
+        month, day, hour, minute, second = values
+
+        return pd.Timestamp(
+            datetime(
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+            )
+        )
+
+    timestamp_field = BinaryFieldDefinition(
+        offset=configuration.timestamp_offset,
+        data_type=configuration.timestamp_data_type,
+    )
+
+    raw_timestamp = unpack_binary_value(
+        record,
+        timestamp_field,
+        configuration.byte_order,
+    )
+
+    if not math.isfinite(raw_timestamp):
+        return pd.NaT
+
+    if mode == "Unix-tijd":
+        unit_mapping = {
+            "seconden": "s",
+            "milliseconden": "ms",
+            "microseconden": "us",
+            "nanoseconden": "ns",
+        }
+
+        unit = unit_mapping[configuration.timestamp_unit]
+
+        return pd.to_datetime(
+            raw_timestamp,
+            unit=unit,
+            origin="unix",
+            errors="coerce",
+        )
+
+    if mode == "Excel-datum":
+        return pd.Timestamp("1899-12-30") + pd.to_timedelta(
+            raw_timestamp,
+            unit="D",
+        )
+
+    if mode == "Tijd sinds aangepaste oorsprong":
+        unit_mapping = {
+            "seconden": "s",
+            "milliseconden": "ms",
+            "microseconden": "us",
+            "dagen": "D",
+        }
+
+        unit = unit_mapping[configuration.timestamp_unit]
+
+        return (
+            pd.Timestamp(configuration.timestamp_origin)
+            + pd.to_timedelta(raw_timestamp, unit=unit)
+        )
+
+    raise ValueError(f"Onbekende tijdstempelmodus: {mode}")
+
+
+def validate_binary_configuration(
+    file_bytes: bytes,
+    configuration: BinaryDecoderConfiguration,
+) -> None:
+    """Valideer de binaire decoderconfiguratie."""
+    if configuration.header_size < 0:
+        raise ValueError("De headerlengte mag niet negatief zijn.")
+
+    if configuration.record_size <= 0:
+        raise ValueError("De recordlengte moet groter zijn dan nul.")
+
+    if configuration.header_size >= len(file_bytes):
+        raise ValueError(
+            "De headerlengte is groter dan of gelijk aan het bestand."
+        )
+
+    remaining_bytes = len(file_bytes) - configuration.header_size
+
+    if remaining_bytes < configuration.record_size:
+        raise ValueError(
+            "Na de header resteert minder dan één volledig record."
+        )
+
+    fields = [configuration.pressure_field]
+
+    if configuration.temperature_field is not None:
+        fields.append(configuration.temperature_field)
+
+    for field in fields:
+        _, size = get_binary_format(
+            field.data_type,
+            configuration.byte_order,
+        )
+
+        if field.offset + size > configuration.record_size:
+            raise ValueError(
+                f"Het veld op offset {field.offset} met lengte {size} "
+                "past niet in de gekozen recordlengte."
+            )
+
+
+def decode_binary_logger(
+    file_bytes: bytes,
+    configuration: BinaryDecoderConfiguration,
+    maximum_records: int | None = None,
+) -> pd.DataFrame:
+    """Decodeer een binair loggerbestand met records van vaste lengte."""
+    validate_binary_configuration(file_bytes, configuration)
+
+    data_size = len(file_bytes) - configuration.header_size
+    record_count = data_size // configuration.record_size
+    remainder = data_size % configuration.record_size
+
+    if remainder:
+        LOGGER.warning(
+            "%s resterende bytes vormen geen volledig record.",
+            remainder,
+        )
+
+    if maximum_records is not None:
+        record_count = min(record_count, maximum_records)
+
+    rows: list[dict[str, object]] = []
+    decoding_errors = 0
+
+    for record_index in range(record_count):
+        record_start = (
+            configuration.header_size
+            + record_index * configuration.record_size
+        )
+        record_end = record_start + configuration.record_size
+        record = file_bytes[record_start:record_end]
+
+        try:
+            timestamp = decode_timestamp(record, configuration)
+
+            pressure = unpack_binary_value(
+                record,
+                configuration.pressure_field,
+                configuration.byte_order,
+            )
+
+            temperature: float | None = None
+
+            if configuration.temperature_field is not None:
+                temperature = unpack_binary_value(
+                    record,
+                    configuration.temperature_field,
+                    configuration.byte_order,
+                )
+
+            rows.append(
+                {
+                    "recordnummer": record_index + 1,
+                    "byte_offset": record_start,
+                    "tijd": timestamp,
+                    "loggerwaarde": pressure,
+                    "temperatuur_c": temperature,
+                    "decodeerfout": "",
+                }
+            )
+
+        except (
+            ValueError,
+            OverflowError,
+            struct.error,
+            TypeError,
+        ) as exc:
+            decoding_errors += 1
+
+            rows.append(
+                {
+                    "recordnummer": record_index + 1,
+                    "byte_offset": record_start,
+                    "tijd": pd.NaT,
+                    "loggerwaarde": np.nan,
+                    "temperatuur_c": np.nan,
+                    "decodeerfout": str(exc),
+                }
+            )
+
+    dataframe = pd.DataFrame(rows)
+
+    if dataframe.empty:
+        raise ValueError("Er konden geen binaire records worden gelezen.")
+
+    valid_rows = dataframe["tijd"].notna() & dataframe["loggerwaarde"].notna()
+
+    if not valid_rows.any():
+        raise ValueError(
+            "Geen enkel binair record leverde een geldig tijdstip en een "
+            "geldige loggerwaarde op. Controleer header, recordlengte, "
+            "bytevolgorde, offsets en datatypes."
+        )
+
+    LOGGER.info(
+        "Binair bestand gedecodeerd: %s records, %s fouten.",
+        len(dataframe),
+        decoding_errors,
+    )
+
+    return dataframe
+
+
+# =============================================================================
+# Tijdreeksen voorbereiden
+# =============================================================================
+
+def prepare_text_logger(
     dataframe: pd.DataFrame,
     date_column: str,
     time_column: str | None,
     value_column: str,
     temperature_column: str | None,
-    datetime_format: str | None,
-    day_first: bool,
     timezone_mode: TimezoneMode,
+    day_first: bool,
 ) -> pd.DataFrame:
-    """Normaliseer loggergegevens naar een standaardstructuur."""
-    result = pd.DataFrame()
+    """Zet een tekstueel loggerbestand om naar de standaardstructuur."""
+    date_values = dataframe[date_column].astype("string").str.strip()
 
-    result["tijd"] = parse_datetime_series(
-        dataframe=dataframe,
-        date_column=date_column,
-        time_column=time_column,
-        datetime_format=datetime_format,
-        day_first=day_first,
+    if time_column:
+        time_values = dataframe[time_column].astype("string").str.strip()
+        datetime_values = date_values + " " + time_values
+    else:
+        datetime_values = date_values
+
+    result = pd.DataFrame(
+        {
+            "tijd": pd.to_datetime(
+                datetime_values,
+                errors="coerce",
+                dayfirst=day_first,
+                format="mixed",
+            ),
+            "loggerwaarde": clean_numeric_series(
+                dataframe[value_column]
+            ),
+        }
     )
 
-    result["tijd"] = localize_datetime_series(
-        result["tijd"],
-        timezone_mode,
-    )
-
-    result["loggerwaarde"] = clean_numeric_series(dataframe[value_column])
-
-    if temperature_column and temperature_column != "(geen temperatuurkolom)":
+    if temperature_column:
         result["temperatuur_c"] = clean_numeric_series(
             dataframe[temperature_column]
         )
     else:
         result["temperatuur_c"] = np.nan
 
-    result["logger_rijnummer"] = np.arange(1, len(result) + 1)
+    result["tijd"] = localize_datetime_series(
+        result["tijd"],
+        timezone_mode,
+    )
 
     result = result.dropna(subset=["tijd"])
     result = result.sort_values("tijd")
-    result = result.drop_duplicates(subset=["tijd"], keep="last")
+    result = result.drop_duplicates("tijd", keep="last")
     result = result.reset_index(drop=True)
 
     if result.empty:
-        raise ValueError(
-            "Er zijn geen geldige logger-tijdstempels gevonden."
-        )
+        raise ValueError("Geen geldige logger-tijdstippen gevonden.")
+
+    return result
+
+
+def prepare_binary_logger(
+    dataframe: pd.DataFrame,
+    timezone_mode: TimezoneMode,
+) -> pd.DataFrame:
+    """Normaliseer reeds gedecodeerde binaire loggerdata."""
+    result = dataframe.copy()
+
+    result["tijd"] = localize_datetime_series(
+        result["tijd"],
+        timezone_mode,
+    )
+
+    result["loggerwaarde"] = pd.to_numeric(
+        result["loggerwaarde"],
+        errors="coerce",
+    )
+
+    result["temperatuur_c"] = pd.to_numeric(
+        result["temperatuur_c"],
+        errors="coerce",
+    )
+
+    result = result.dropna(subset=["tijd"])
+    result = result.sort_values("tijd")
+    result = result.drop_duplicates("tijd", keep="last")
+    result = result.reset_index(drop=True)
+
+    if result.empty:
+        raise ValueError("Geen geldige binaire loggerrecords gevonden.")
 
     return result
 
@@ -685,19 +919,30 @@ def prepare_knmi_data(
     date_column: str,
     time_column: str | None,
     pressure_column: str,
-    datetime_format: str | None,
-    day_first: bool,
     timezone_mode: TimezoneMode,
+    day_first: bool,
 ) -> pd.DataFrame:
-    """Normaliseer KNMI-gegevens naar een standaardstructuur."""
-    result = pd.DataFrame()
+    """Normaliseer een KNMI-tabel."""
+    date_values = dataframe[date_column].astype("string").str.strip()
 
-    result["tijd"] = parse_datetime_series(
-        dataframe=dataframe,
-        date_column=date_column,
-        time_column=time_column,
-        datetime_format=datetime_format,
-        day_first=day_first,
+    if time_column:
+        time_values = dataframe[time_column].astype("string").str.strip()
+        datetime_values = date_values + " " + time_values
+    else:
+        datetime_values = date_values
+
+    result = pd.DataFrame(
+        {
+            "tijd": pd.to_datetime(
+                datetime_values,
+                errors="coerce",
+                dayfirst=day_first,
+                format="mixed",
+            ),
+            "knmi_druk_bronwaarde": clean_numeric_series(
+                dataframe[pressure_column]
+            ),
+        }
     )
 
     result["tijd"] = localize_datetime_series(
@@ -705,21 +950,10 @@ def prepare_knmi_data(
         timezone_mode,
     )
 
-    result["knmi_druk_bronwaarde"] = clean_numeric_series(
-        dataframe[pressure_column]
-    )
-
     result = result.dropna(
         subset=["tijd", "knmi_druk_bronwaarde"]
     )
-    result = result.sort_values("tijd")
 
-    if result.empty:
-        raise ValueError(
-            "Er zijn geen geldige KNMI-tijdstempels en drukwaarden gevonden."
-        )
-
-    # Gemiddelde gebruiken als meerdere metingen hetzelfde tijdstip hebben.
     result = (
         result.groupby("tijd", as_index=False)
         .agg({"knmi_druk_bronwaarde": "mean"})
@@ -727,8 +961,17 @@ def prepare_knmi_data(
         .reset_index(drop=True)
     )
 
+    if len(result) < 2:
+        raise ValueError(
+            "Minimaal twee geldige KNMI-metingen zijn noodzakelijk."
+        )
+
     return result
 
+
+# =============================================================================
+# Interpolatie en waterstandsberekening
+# =============================================================================
 
 def interpolate_knmi_pressure(
     logger_data: pd.DataFrame,
@@ -736,12 +979,7 @@ def interpolate_knmi_pressure(
     knmi_pressure_unit: str,
     maximum_gap_hours: float,
 ) -> pd.DataFrame:
-    """
-    Interpoleer de KNMI-luchtdruk lineair naar logger-tijdstippen.
-
-    Meetpunten buiten het KNMI-tijdsbereik worden niet geëxtrapoleerd.
-    Daarnaast worden interpolaties over een te groot KNMI-datagat afgekeurd.
-    """
+    """Interpoleer KNMI-luchtdruk naar de logger-tijdstippen."""
     logger = logger_data.copy()
     knmi = knmi_data.copy()
 
@@ -750,58 +988,60 @@ def interpolate_knmi_pressure(
         knmi_pressure_unit,
     )
 
-    logger_times_ns = logger["tijd"].astype("int64").to_numpy()
-    knmi_times_ns = knmi["tijd"].astype("int64").to_numpy()
-    pressure_values = knmi["luchtdruk_pa"].to_numpy(dtype=float)
+    logger_times = logger["tijd"].astype("int64").to_numpy()
+    knmi_times = knmi["tijd"].astype("int64").to_numpy()
+    pressures = knmi["luchtdruk_pa"].to_numpy(dtype=float)
 
-    interpolated = np.full(len(logger), np.nan, dtype=float)
-    source_gap_hours = np.full(len(logger), np.nan, dtype=float)
-    is_outside_range = np.zeros(len(logger), dtype=bool)
+    interpolated = np.full(len(logger), np.nan)
+    source_intervals = np.full(len(logger), np.nan)
+    outside_range = np.zeros(len(logger), dtype=bool)
 
-    if len(knmi) < 2:
-        raise ValueError(
-            "Voor interpolatie zijn minimaal twee geldige KNMI-metingen nodig."
-        )
-
-    positions = np.searchsorted(knmi_times_ns, logger_times_ns)
+    positions = np.searchsorted(
+        knmi_times,
+        logger_times,
+        side="left",
+    )
 
     for index, position in enumerate(positions):
-        logger_time = logger_times_ns[index]
+        logger_time = logger_times[index]
 
         if position == 0:
-            if logger_time == knmi_times_ns[0]:
-                source_gap_hours[index] = 0.0
+            if logger_time == knmi_timesinterpolated[index] = pressures[0]
+                source_intervals[index] = 0.0
             else:
-                is_outside_range[index] = True
+                outside_range[index] = True
             continue
 
-        if position >= len(knmi_times_ns):
-            if logger_time == knmi_times_ns[-1]:
-                interpolated[index] = pressure_values[-1]
-                source_gap_hours[index] = 0.0
+        if position >= len(knmi_times):
+            if logger_time == knmi_times[-1]:
+                interpolated[index] = pressures[-1]
+                source_intervals[index] = 0.0
             else:
-                is_outside_range[index] = True
+                outside_range[index] = True
             continue
 
-        previous_time = knmi_times_ns[position - 1]
-        next_time = knmi_times_ns[position]
-        previous_pressure = pressure_values[position - 1]
-        next_pressure = pressure_values[position]
+        previous_time = knmi_times[position - 1]
+        next_time = knmi_times[position]
+        previous_pressure = pressures[position - 1]
+        next_pressure = pressures[position]
 
         if logger_time == previous_time:
             interpolated[index] = previous_pressure
-            source_gap_hours[index] = 0.0
+            source_intervals[index] = 0.0
             continue
 
         if logger_time == next_time:
             interpolated[index] = next_pressure
-            source_gap_hours[index] = 0.0
+            source_intervals[index] = 0.0
             continue
 
         interval_ns = next_time - previous_time
-        interval_hours = interval_ns / 3_600_000_000_000
 
-        source_gap_hours[index] = interval_hours
+        if interval_ns <= 0:
+            continue
+
+        interval_hours = interval_ns / NANOSECONDS_PER_HOUR
+        source_intervals[index] = interval_hours
 
         if interval_hours > maximum_gap_hours:
             continue
@@ -814,36 +1054,38 @@ def interpolate_knmi_pressure(
         )
 
     logger["luchtdruk_pa"] = interpolated
-    logger["knmi_broninterval_uur"] = source_gap_hours
-    logger["buiten_knmi_periode"] = is_outside_range
+    logger["knmi_broninterval_uur"] = source_intervals
+    logger["buiten_knmi_periode"] = outside_range
 
     return logger
 
 
-def calculate_groundwater_levels(
-    combined_data: pd.DataFrame,
+def calculate_water_levels(
+    dataframe: pd.DataFrame,
     configuration: PeilfilterConfiguration,
 ) -> pd.DataFrame:
-    """
-    Bereken waterkolom, waterstand NAP en stijghoogte vanaf bovenkant peilbuis.
-    """
-    result = combined_data.copy()
+    """Bereken de waterkolom en waterstand ten opzichte van NAP."""
+    result = dataframe.copy()
 
     temperature = result["temperatuur_c"].fillna(
-        configuration.default_water_temperature_c
+        configuration.default_temperature_c
     )
 
-    if configuration.use_temperature_density:
-        result["waterdichtheid_kg_m3"] = water_density_kg_m3(temperature)
-    else:
-        result["waterdichtheid_kg_m3"] = DEFAULT_WATER_DENSITY
-
     result["gebruikte_temperatuur_c"] = temperature
+
+    if configuration.use_temperature_density:
+        result["waterdichtheid_kg_m3"] = water_density_kg_m3(
+            temperature
+        )
+    else:
+        result["waterdichtheid_kg_m3"] = (
+            DEFAULT_WATER_DENSITY_KG_M3
+        )
 
     if configuration.logger_mode == "absolute_pressure":
         result["loggerdruk_pa"] = pressure_to_pa(
             result["loggerwaarde"],
-            configuration.logger_pressure_unit,
+            configuration.logger_unit,
         )
 
         result["wateroverdruk_pa"] = (
@@ -852,150 +1094,95 @@ def calculate_groundwater_levels(
 
         result["waterkolom_m"] = (
             result["wateroverdruk_pa"]
-            / (result["waterdichtheid_kg_m3"] * GRAVITY)
+            / (
+                result["waterdichtheid_kg_m3"]
+                * GRAVITY_M_S2
+            )
         )
-
-    elif configuration.logger_mode == "water_column":
+    else:
         result["loggerdruk_pa"] = np.nan
         result["wateroverdruk_pa"] = np.nan
         result["waterkolom_m"] = length_to_m(
             result["loggerwaarde"],
-            configuration.water_column_unit,
-        )
-
-    else:
-        raise ValueError(
-            f"Onbekende loggermodus: {configuration.logger_mode}"
+            configuration.logger_unit,
         )
 
     result["filter_id"] = configuration.filter_id
-    result["bovenkant_peilbuis_nap_m"] = configuration.top_casing_nap_m
+    result["bovenkant_peilbuis_nap_m"] = (
+        configuration.top_casing_nap_m
+    )
     result["kabellengte_m"] = configuration.cable_length_m
-    result["sensorhoogte_nap_m"] = configuration.sensor_elevation_nap_m
-
-    result["waterstand_nap_m"] = (
-        result["sensorhoogte_nap_m"] + result["waterkolom_m"]
+    result["sensorhoogte_nap_m"] = (
+        configuration.sensor_elevation_nap_m
     )
 
-    # Positieve waarde betekent: water bevindt zich onder de bovenkant.
+    result["waterstand_nap_m"] = (
+        result["sensorhoogte_nap_m"]
+        + result["waterkolom_m"]
+    )
+
     result["waterdiepte_tov_bovenkant_m"] = (
-        configuration.top_casing_nap_m - result["waterstand_nap_m"]
+        configuration.top_casing_nap_m
+        - result["waterstand_nap_m"]
     )
 
     result["luchtdruk_hpa"] = result["luchtdruk_pa"] / 100.0
 
-    result["kwaliteitscode"] = build_quality_codes(result)
+    result["kwaliteitscode"] = "OK"
+
+    result.loc[
+        result["loggerwaarde"].isna(),
+        "kwaliteitscode",
+    ] = "LOGGER_ONTBREEKT"
+
+    result.loc[
+        result["luchtdruk_pa"].isna()
+        & (configuration.logger_mode == "absolute_pressure"),
+        "kwaliteitscode",
+    ] = "LUCHTDRUK_ONTBREEKT"
+
+    result.loc[
+        result["waterkolom_m"] < 0,
+        "kwaliteitscode",
+    ] = "NEGATIEVE_WATERKOLOM"
+
+    result.loc[
+        (result["waterkolom_m"] > 100)
+        | (result["waterkolom_m"] < -5),
+        "kwaliteitscode",
+    ] = "BUITEN_BEREIK"
 
     return result
 
 
-def build_quality_codes(dataframe: pd.DataFrame) -> pd.Series:
-    """
-    Stel per meetregel een compacte kwaliteitscode samen.
-
-    Codes:
-        OK      Geldige berekening.
-        L-MIS   Loggerwaarde ontbreekt.
-        K-MIS   KNMI-luchtdruk ontbreekt.
-        K-EXT   Tijdstip ligt buiten KNMI-periode.
-        NEG     Negatieve waterkolom.
-        RANGE   Onwaarschijnlijke waterstand of waterkolom.
-    """
-    codes: list[str] = []
-
-    for row in dataframe.itertuples(index=False):
-        row_codes: list[str] = []
-
-        if pd.isna(row.loggerwaarde):
-            row_codes.append("L-MIS")
-
-        if pd.isna(row.luchtdruk_pa):
-            row_codes.append("K-MIS")
-
-        if bool(row.buiten_knmi_periode):
-            row_codes.append("K-EXT")
-
-        if pd.notna(row.waterkolom_m) and row.waterkolom_m < 0:
-            row_codes.append("NEG")
-
-        implausible = (
-            pd.notna(row.waterkolom_m)
-            and (
-                row.waterkolom_m > 100.0
-                or row.waterkolom_m < -5.0
-            )
-        )
-
-        if implausible:
-            row_codes.append("RANGE")
-
-        codes.append("|".join(row_codes) if row_codes else "OK")
-
-    return pd.Series(codes, index=dataframe.index, dtype="string")
-
-
-def summarize_quality(dataframe: pd.DataFrame) -> DataQualitySummary:
-    """Maak een samenvatting van de datakwaliteit."""
-    valid_mask = (
-        dataframe["waterstand_nap_m"].notna()
-        & dataframe["loggerwaarde"].notna()
-    )
-
-    implausible_mask = (
-        (dataframe["waterkolom_m"] > 100.0)
-        | (dataframe["waterkolom_m"] < -5.0)
-    ).fillna(False)
-
-    return DataQualitySummary(
-        total_rows=len(dataframe),
-        valid_rows=int(valid_mask.sum()),
-        missing_logger_values=int(
-            dataframe["loggerwaarde"].isna().sum()
-        ),
-        missing_knmi_values=int(
-            dataframe["luchtdruk_pa"].isna().sum()
-        ),
-        negative_water_columns=int(
-            (dataframe["waterkolom_m"] < 0).fillna(False).sum()
-        ),
-        extrapolated_rows=int(
-            dataframe["buiten_knmi_periode"].fillna(False).sum()
-        ),
-        implausible_rows=int(implausible_mask.sum()),
-    )
-
-
-# ============================================================================
-# Presentatie en export
-# ============================================================================
+# =============================================================================
+# Export en grafieken
+# =============================================================================
 
 def dataframe_to_csv_bytes(dataframe: pd.DataFrame) -> bytes:
-    """Exporteer een DataFrame als Nederlandstalige CSV."""
-    export_data = dataframe.copy()
+    """Exporteer resultaten naar een Nederlandse CSV."""
+    export = dataframe.copy()
 
-    datetime_columns = export_data.select_dtypes(
-        include=["datetime64[ns]", "datetimetz"]
-    ).columns
+    for column in export.columns:
+        if pd.api.types.is_datetime64_any_dtype(export[column]):
+            export[column] = export[column].dt.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
 
-    for column in datetime_columns:
-        export_data[column] = export_data[column].dt.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-
-    csv_text = export_data.to_csv(
+    return export.to_csv(
         index=False,
         sep=";",
         decimal=",",
         na_rep="",
         lineterminator="\n",
-    )
-
-    return csv_text.encode("utf-8-sig")
+    ).encode("utf-8-sig")
 
 
 def create_water_level_figure(dataframe: pd.DataFrame) -> go.Figure:
-    """Maak een interactieve figuur van de berekende waterstand."""
-    valid = dataframe.dropna(subset=["tijd", "waterstand_nap_m"])
+    """Maak een interactieve waterstandgrafiek."""
+    valid = dataframe.dropna(
+        subset=["tijd", "waterstand_nap_m"]
+    )
 
     figure = go.Figure()
 
@@ -1004,291 +1191,436 @@ def create_water_level_figure(dataframe: pd.DataFrame) -> go.Figure:
             x=valid["tijd"],
             y=valid["waterstand_nap_m"],
             mode="lines",
-            name="Waterstand NAP",
+            name="Waterstand",
             line={"color": "#0078D4", "width": 2},
             hovertemplate=(
-                "Tijd: %{x|%d-%m-%Y %H:%M}<br>"
-                "Waterstand: %{y:.3f} m NAP"
+                "%{x|%d-%m-%Y %H:%M}<br>"
+                "%{y:.3f} m NAP"
                 "<extra></extra>"
             ),
         )
     )
 
-    figure.add_hline(
-        y=float(dataframe["bovenkant_peilbuis_nap_m"].iloc[0]),
-        line_dash="dash",
-        line_color="#D83B01",
-        annotation_text="Bovenkant peilbuis",
-        annotation_position="top left",
-    )
+    if not dataframe.empty:
+        figure.add_hline(
+            y=float(
+                dataframe["bovenkant_peilbuis_nap_m"].iloc[0]
+            ),
+            line_dash="dash",
+            line_color="#D83B01",
+            annotation_text="Bovenkant peilbuis",
+        )
 
     figure.update_layout(
-        title="Grondwaterstand ten opzichte van NAP",
+        title="Berekende grondwaterstand",
         xaxis_title="Datum en tijd",
         yaxis_title="Waterstand (m NAP)",
         hovermode="x unified",
-        legend_title="Reeks",
-        margin={"l": 60, "r": 20, "t": 60, "b": 50},
     )
 
     return figure
 
 
-def create_pressure_figure(dataframe: pd.DataFrame) -> go.Figure:
-    """Maak een figuur van loggerdruk en geïnterpoleerde luchtdruk."""
-    figure = go.Figure()
+# =============================================================================
+# Streamlit-componenten
+# =============================================================================
 
-    if dataframe["loggerdruk_pa"].notna().any():
-        figure.add_trace(
-            go.Scatter(
-                x=dataframe["tijd"],
-                y=dataframe["loggerdruk_pa"] / 100.0,
-                mode="lines",
-                name="Absolute loggerdruk",
-                line={"color": "#107C10", "width": 1.5},
+def render_timezone_selector(
+    key: str,
+    default: TimezoneMode,
+) -> TimezoneMode:
+    """Toon een tijdzoneselectie."""
+    options: list[TimezoneMode] = [
+        "Nederlandse lokale tijd",
+        "UTC",
+        "Geen tijdzonecorrectie",
+    ]
+
+    return st.selectbox(
+        "Tijdzone in het bestand",
+        options=options,
+        index=options.index(default),
+        key=key,
+    )
+
+
+def render_binary_field(
+    label: str,
+    key: str,
+    default_offset: int,
+    default_type: str,
+    default_scale: float,
+) -> BinaryFieldDefinition:
+    """Toon invoervelden voor één binair numeriek veld."""
+    st.markdown(f"**{label}**")
+
+    columns = st.columns(4)
+
+    offset = columns[0].number_input(
+        "Byte-offset",
+        min_value=0,
+        value=default_offset,
+        step=1,
+        key=f"{key}_offset",
+    )
+
+    data_type = columns[1].selectbox(
+        "Datatype",
+        options=list(BINARY_VALUE_FORMATS),
+        index=list(BINARY_VALUE_FORMATS).index(default_type),
+        key=f"{key}_datatype",
+    )
+
+    scale = columns[2].number_input(
+        "Schaalfactor",
+        value=default_scale,
+        format="%.10f",
+        key=f"{key}_scale",
+    )
+
+    value_offset = columns[3].number_input(
+        "Waarde-offset",
+        value=0.0,
+        format="%.10f",
+        key=f"{key}_value_offset",
+    )
+
+    return BinaryFieldDefinition(
+        offset=int(offset),
+        data_type=data_type,
+        scale=float(scale),
+        value_offset=float(value_offset),
+    )
+
+
+def render_binary_configuration(
+    file_bytes: bytes,
+) -> BinaryDecoderConfiguration:
+    """Toon alle configuratievelden voor de binaire decoder."""
+    st.subheader("Binaire bestandsstructuur")
+
+    st.warning(
+        "Controleer de technische documentatie van de logger. "
+        "Onjuiste offsets of datatypes kunnen plausibele maar foutieve "
+        "meetwaarden veroorzaken."
+    )
+
+    preview_columns = st.columns(3)
+
+    preview_start = preview_columns[0].number_input(
+        "Startpositie hex-preview",
+        min_value=0,
+        max_value=max(0, len(file_bytes) - 1),
+        value=0,
+        step=16,
+    )
+
+    preview_length = preview_columns[1].number_input(
+        "Aantal previewbytes",
+        min_value=16,
+        max_value=min(8_192, len(file_bytes)),
+        value=min(512, len(file_bytes)),
+        step=16,
+    )
+
+    preview_columns[2].metric(
+        "Bestandsgrootte",
+        f"{len(file_bytes):,} bytes",
+    )
+
+    st.code(
+        create_hex_preview(
+            file_bytes,
+            start=int(preview_start),
+            length=int(preview_length),
+        ),
+        language="text",
+    )
+
+    structure_columns = st.columns(3)
+
+    header_size = structure_columns[0].number_input(
+        "Headerlengte in bytes",
+        min_value=0,
+        max_value=max(0, len(file_bytes) - 1),
+        value=0,
+        step=1,
+    )
+
+    record_size = structure_columns[1].number_input(
+        "Recordlengte in bytes",
+        min_value=1,
+        max_value=65_536,
+        value=16,
+        step=1,
+    )
+
+    byte_order = structure_columns[2].selectbox(
+        "Bytevolgorde",
+        options=["Little-endian", "Big-endian"],
+    )
+
+    remaining = len(file_bytes) - int(header_size)
+    possible_records = (
+        remaining // int(record_size)
+        if record_size
+        else 0
+    )
+    remainder = (
+        remaining % int(record_size)
+        if record_size
+        else 0
+    )
+
+    st.info(
+        f"Deze configuratie levert maximaal {possible_records:,} records "
+        f"op, met {remainder} resterende bytes."
+    )
+
+    st.markdown("**Tijdstempel**")
+
+    timestamp_mode = st.selectbox(
+        "Tijdstempelopslag",
+        options=[
+            "Unix-tijd",
+            "Excel-datum",
+            "Tijd sinds aangepaste oorsprong",
+            "Losse datumvelden",
+        ],
+    )
+
+    timestamp_offset = 0
+    timestamp_data_type = "Unsigned integer 32-bit"
+    timestamp_unit = "seconden"
+    timestamp_origin = datetime(1970, 1, 1)
+
+    year_offset = 0
+    month_offset = 2
+    day_offset = 3
+    hour_offset = 4
+    minute_offset = 5
+    second_offset = 6
+    year_data_type = "Unsigned integer 16-bit"
+
+    if timestamp_mode == "Losse datumvelden":
+        date_columns_1 = st.columns(4)
+        date_columns_2 = st.columns(3)
+
+        year_offset = int(
+            date_columns_1[0].number_input(
+                "Offset jaar",
+                min_value=0,
+                value=0,
+                step=1,
             )
         )
 
-    figure.add_trace(
-        go.Scatter(
-            x=dataframe["tijd"],
-            y=dataframe["luchtdruk_hpa"],
-            mode="lines",
-            name="KNMI-luchtdruk",
-            line={"color": "#5C2D91", "width": 1.5},
-        )
-    )
-
-    figure.update_layout(
-        title="Loggerdruk en atmosferische luchtdruk",
-        xaxis_title="Datum en tijd",
-        yaxis_title="Druk (hPa)",
-        hovermode="x unified",
-        legend_title="Reeks",
-        margin={"l": 60, "r": 20, "t": 60, "b": 50},
-    )
-
-    return figure
-
-
-def show_quality_summary(summary: DataQualitySummary) -> None:
-    """Toon de kwaliteitssamenvatting in de Streamlit-interface."""
-    columns = st.columns(4)
-
-    columns[0].metric("Meetregels", f"{summary.total_rows:,}")
-    columns[1].metric("Geldige resultaten", f"{summary.valid_rows:,}")
-    columns[2].metric(
-        "Ontbrekende KNMI-waarden",
-        f"{summary.missing_knmi_values:,}",
-    )
-    columns[3].metric(
-        "Negatieve waterkolommen",
-        f"{summary.negative_water_columns:,}",
-    )
-
-    warnings: list[str] = []
-
-    if summary.missing_logger_values:
-        warnings.append(
-            f"{summary.missing_logger_values} loggerwaarden ontbreken."
+        year_data_type = date_columns_1[1].selectbox(
+            "Datatype jaar",
+            options=[
+                "Unsigned integer 16-bit",
+                "Signed integer 16-bit",
+                "Unsigned integer 32-bit",
+            ],
         )
 
-    if summary.missing_knmi_values:
-        warnings.append(
-            f"{summary.missing_knmi_values} tijden konden niet aan geldige "
-            "KNMI-luchtdruk worden gekoppeld."
+        month_offset = int(
+            date_columns_1[2].number_input(
+                "Offset maand",
+                min_value=0,
+                value=2,
+                step=1,
+            )
         )
 
-    if summary.extrapolated_rows:
-        warnings.append(
-            f"{summary.extrapolated_rows} tijden liggen buiten de periode "
-            "van het KNMI-bestand."
+        day_offset = int(
+            date_columns_1[3].number_input(
+                "Offset dag",
+                min_value=0,
+                value=3,
+                step=1,
+            )
         )
 
-    if summary.negative_water_columns:
-        warnings.append(
-            f"{summary.negative_water_columns} berekende waterkolommen zijn "
-            "negatief. Controleer de drukeenheden en de luchtdrukreeks."
+        hour_offset = int(
+            date_columns_2[0].number_input(
+                "Offset uur",
+                min_value=0,
+                value=4,
+                step=1,
+            )
         )
 
-    if summary.implausible_rows:
-        warnings.append(
-            f"{summary.implausible_rows} uitkomsten vallen buiten de "
-            "standaard plausibiliteitsgrenzen."
+        minute_offset = int(
+            date_columns_2[1].number_input(
+                "Offset minuut",
+                min_value=0,
+                value=5,
+                step=1,
+            )
         )
 
-    if warnings:
-        st.warning("\n\n".join(warnings))
+        second_offset = int(
+            date_columns_2[2].number_input(
+                "Offset seconde",
+                min_value=0,
+                value=6,
+                step=1,
+            )
+        )
+
     else:
-        st.success("De automatische kwaliteitscontrole heeft geen problemen gevonden.")
+        timestamp_columns = st.columns(4)
 
-
-# ============================================================================
-# Streamlit-interface
-# ============================================================================
-
-def configure_page() -> None:
-    """Configureer de Streamlit-pagina."""
-    st.set_page_config(
-        page_title=APP_TITLE,
-        page_icon="💧",
-        layout="wide",
-    )
-
-    st.title("💧 Grondwaterstanden omrekenen naar NAP")
-
-    st.markdown(
-        """
-        Upload een loggerbestand en een bestand met lokale KNMI-luchtdruk.
-        De applicatie compenseert de absolute loggerdruk voor atmosferische
-        druk en berekent vervolgens de grondwaterstand in meter NAP.
-        """
-    )
-
-    with st.expander("Berekeningsmethode en belangrijke aandachtspunten"):
-        st.markdown(
-            """
-            **Berekening**
-
-            1. Sensorhoogte NAP = bovenkant peilbuis NAP − kabellengte
-            2. Wateroverdruk = absolute loggerdruk − atmosferische druk
-            3. Waterkolom = wateroverdruk ÷ (waterdichtheid × zwaartekracht)
-            4. Waterstand NAP = sensorhoogte NAP + waterkolom
-
-            **Belangrijk**
-
-            - Gebruik de kabellengte tot het drukpunt van de logger.
-            - Gebruik bij voorkeur KNMI-luchtdruk op stationsniveau.
-            - Controleer of de logger absolute druk of al gecompenseerde
-              waterkolom registreert.
-            - KNMI-luchtdruk kan in 0,1 hPa zijn opgeslagen.
-            - Controleer of beide bestanden UTC of Nederlandse lokale tijd
-              gebruiken.
-            """
+        timestamp_offset = int(
+            timestamp_columns[0].number_input(
+                "Offset tijdstempel",
+                min_value=0,
+                value=0,
+                step=1,
+            )
         )
 
+        timestamp_data_type = timestamp_columns[1].selectbox(
+            "Datatype tijdstempel",
+            options=list(BINARY_VALUE_FORMATS),
+            index=list(BINARY_VALUE_FORMATS).index(
+                "Unsigned integer 32-bit"
+            ),
+        )
 
-def file_reading_controls(
+        if timestamp_mode == "Excel-datum":
+            timestamp_unit = "dagen"
+            timestamp_columns[2].text_input(
+                "Eenheid",
+                value="dagen",
+                disabled=True,
+            )
+        else:
+            unit_options = [
+                "seconden",
+                "milliseconden",
+                "microseconden",
+            ]
+
+            if timestamp_mode == "Tijd sinds aangepaste oorsprong":
+                unit_options.append("dagen")
+
+            timestamp_unit = timestamp_columns[2].selectbox(
+                "Tijdseenheid",
+                options=unit_options,
+            )
+
+        if timestamp_mode == "Tijd sinds aangepaste oorsprong":
+            origin_date = timestamp_columns[3].date_input(
+                "Oorsprongsdatum",
+                value=datetime(1970, 1, 1).date(),
+            )
+            timestamp_origin = datetime.combine(
+                origin_date,
+                datetime.min.time(),
+            )
+
+    pressure_field = render_binary_field(
+        label="Loggerdruk of waterkolom",
+        key="binary_pressure",
+        default_offset=4,
+        default_type="Float 32-bit",
+        default_scale=1.0,
+    )
+
+    has_temperature = st.checkbox(
+        "Het binaire record bevat temperatuur",
+        value=True,
+    )
+
+    temperature_field: BinaryFieldDefinition | None = None
+
+    if has_temperature:
+        temperature_field = render_binary_field(
+            label="Temperatuur",
+            key="binary_temperature",
+            default_offset=8,
+            default_type="Float 32-bit",
+            default_scale=1.0,
+        )
+
+    return BinaryDecoderConfiguration(
+        header_size=int(header_size),
+        record_size=int(record_size),
+        byte_order=byte_order,
+        timestamp_mode=timestamp_mode,
+        timestamp_offset=timestamp_offset,
+        timestamp_data_type=timestamp_data_type,
+        timestamp_unit=timestamp_unit,
+        timestamp_origin=timestamp_origin,
+        pressure_field=pressure_field,
+        temperature_field=temperature_field,
+        year_offset=year_offset,
+        month_offset=month_offset,
+        day_offset=day_offset,
+        hour_offset=hour_offset,
+        minute_offset=minute_offset,
+        second_offset=second_offset,
+        year_data_type=year_data_type,
+    )
+
+
+def render_text_table_settings(
     prefix: str,
 ) -> tuple[str, str, int]:
-    """Maak herbruikbare instellingen voor het inlezen van een bestand."""
-    left, middle, right = st.columns(3)
+    """Toon instellingen voor een teksttabel."""
+    columns = st.columns(3)
 
-    separator = left.selectbox(
+    separator = columns[0].selectbox(
         "Scheidingsteken",
         options=[
             "Automatisch",
             "Puntkomma",
-            "Tab",
             "Komma",
+            "Tab",
             "Pipe",
             "Spaties",
         ],
         key=f"{prefix}_separator",
     )
 
-    decimal = middle.selectbox(
+    decimal = columns[1].selectbox(
         "Decimaalteken",
         options=[",", "."],
-        index=0,
         key=f"{prefix}_decimal",
     )
 
-    automatic_header = right.checkbox(
-        "Tabelkop automatisch zoeken",
-        value=True,
-        key=f"{prefix}_automatic_header",
+    header_row = columns[2].number_input(
+        "Regelnummer tabelkop",
+        min_value=0,
+        value=0,
+        step=1,
+        key=f"{prefix}_header",
     )
 
-    if automatic_header:
-        skip_rows = -1
-    else:
-        skip_rows = right.number_input(
-            "Regels overslaan",
-            min_value=0,
-            max_value=500,
-            value=0,
-            step=1,
-            key=f"{prefix}_skip_rows",
-        )
-
-    return separator, decimal, int(skip_rows)
-
-
-def datetime_mapping_controls(
-    dataframe: pd.DataFrame,
-    prefix: str,
-    default_timezone: TimezoneMode,
-) -> tuple[str, str | None, str | None, bool, TimezoneMode]:
-    """Toon instellingen voor datum-, tijd- en tijdzonekolommen."""
-    columns = list(dataframe.columns)
-
-    suggested_date = detect_suggested_column(
-        columns,
-        DATETIME_COLUMN_HINTS,
-    )
-
-    date_column = st.selectbox(
-        "Datum- of datum/tijdkolom",
-        options=columns,
-        index=columns.index(suggested_date),
-        key=f"{prefix}_date_column",
-    )
-
-    time_options = ["(geen aparte tijdkolom)"] + columns
-
-    time_column = st.selectbox(
-        "Optionele aparte tijdkolom",
-        options=time_options,
-        index=0,
-        key=f"{prefix}_time_column",
-    )
-
-    datetime_format_label = st.selectbox(
-        "Datumformaat",
-        options=list(DATETIME_FORMAT_OPTIONS.keys()),
-        index=0,
-        key=f"{prefix}_datetime_format",
-    )
-
-    day_first = st.checkbox(
-        "Dag staat vóór maand",
-        value=True,
-        key=f"{prefix}_day_first",
-    )
-
-    timezone_options: list[TimezoneMode] = [
-        "Nederlandse lokale tijd",
-        "UTC",
-        "Geen tijdzonecorrectie",
-    ]
-
-    timezone_mode = st.selectbox(
-        "Tijdzone van het bestand",
-        options=timezone_options,
-        index=timezone_options.index(default_timezone),
-        key=f"{prefix}_timezone",
-    )
-
-    normalized_time_column: str | None = time_column
-
-    if time_column == "(geen aparte tijdkolom)":
-        normalized_time_column = None
-
-    return (
-        date_column,
-        normalized_time_column,
-        DATETIME_FORMAT_OPTIONS[datetime_format_label],
-        day_first,
-        timezone_mode,
-    )
+    return separator, decimal, int(header_row)
 
 
 def main() -> None:
     """Start de Streamlit-applicatie."""
-    configure_page()
+    st.set_page_config(
+        page_title=APP_TITLE,
+        page_icon="💧",
+        layout="wide",
+    )
 
-    st.header("1. Peilfilter en logger")
+    st.title("💧 Waterstanden omrekenen naar NAP")
+
+    st.markdown(
+        """
+        Deze applicatie verwerkt tekstuele en binaire loggerbestanden,
+        compenseert absolute loggerdruk met KNMI-luchtdruk en berekent
+        waterstanden ten opzichte van NAP.
+        """
+    )
+
+    st.header("1. Meetopstelling")
 
     configuration_columns = st.columns(4)
 
@@ -1302,10 +1634,6 @@ def main() -> None:
         value=1.000,
         step=0.001,
         format="%.3f",
-        help=(
-            "De ingemeten hoogte van de bovenkant van de peilbuis "
-            "ten opzichte van NAP."
-        ),
     )
 
     cable_length_m = configuration_columns[2].number_input(
@@ -1314,238 +1642,348 @@ def main() -> None:
         value=5.000,
         step=0.001,
         format="%.3f",
-        help=(
-            "Afstand vanaf de bovenkant van de peilbuis tot het drukpunt "
-            "van de logger."
-        ),
     )
 
     logger_mode_label = configuration_columns[3].selectbox(
         "Type loggerwaarde",
-        options=list(LOGGER_MODES.keys()),
-        index=0,
+        options=list(LOGGER_MODES),
     )
 
     logger_mode = LOGGER_MODES[logger_mode_label]
 
     unit_columns = st.columns(4)
 
-    logger_pressure_unit = unit_columns[0].selectbox(
-        "Eenheid loggerdruk",
-        options=list(PRESSURE_UNIT_FACTORS_TO_PA.keys()),
-        index=list(PRESSURE_UNIT_FACTORS_TO_PA.keys()).index("hPa"),
-        disabled=logger_mode != "absolute_pressure",
-    )
+    if logger_mode == "absolute_pressure":
+        logger_unit = unit_columns[0].selectbox(
+            "Eenheid loggerdruk",
+            options=list(PRESSURE_UNIT_FACTORS_TO_PA),
+            index=list(PRESSURE_UNIT_FACTORS_TO_PA).index("hPa"),
+        )
+    else:
+        logger_unit = unit_columns[0].selectbox(
+            "Eenheid waterkolom",
+            options=list(LENGTH_UNIT_FACTORS_TO_M),
+        )
 
-    water_column_unit = unit_columns[1].selectbox(
-        "Eenheid logger-waterkolom",
-        options=list(LENGTH_UNIT_FACTORS_TO_M.keys()),
-        index=0,
-        disabled=logger_mode != "water_column",
-    )
-
-    knmi_pressure_unit = unit_columns[2].selectbox(
+    knmi_unit = unit_columns[1].selectbox(
         "Eenheid KNMI-luchtdruk",
-        options=list(PRESSURE_UNIT_FACTORS_TO_PA.keys()),
-        index=list(PRESSURE_UNIT_FACTORS_TO_PA.keys()).index("0,1 hPa"),
+        options=list(PRESSURE_UNIT_FACTORS_TO_PA),
+        index=list(PRESSURE_UNIT_FACTORS_TO_PA).index("0,1 hPa"),
         disabled=logger_mode != "absolute_pressure",
-        help=(
-            "Veel KNMI-bestanden slaan luchtdruk op in 0,1 hPa. "
-            "Een waarde 10134 betekent dan 1013,4 hPa."
-        ),
     )
 
-    default_temperature_c = unit_columns[3].number_input(
+    default_temperature = unit_columns[2].number_input(
         "Standaard watertemperatuur (°C)",
         min_value=0.0,
         max_value=40.0,
         value=12.0,
         step=0.1,
-        format="%.1f",
     )
 
-    use_temperature_density = st.checkbox(
-        "Corrigeer waterdichtheid op basis van watertemperatuur",
+    use_temperature_density = unit_columns[3].checkbox(
+        "Temperatuurcorrectie",
         value=True,
     )
 
     sensor_elevation = top_casing_nap_m - cable_length_m
 
     st.info(
-        f"De berekende sensorhoogte is **{sensor_elevation:.3f} m NAP**."
+        f"Sensorhoogte: **{sensor_elevation:.3f} m NAP**"
     )
 
     st.header("2. Loggerbestand")
 
     logger_file = st.file_uploader(
-        "Upload het loggerbestand",
-        type=["dat", "csv", "txt"],
-        key="logger_file",
+        "Upload loggerbestand",
+        type=["dat", "bin", "csv", "txt"],
     )
 
     if logger_file is None:
-        st.info("Upload eerst een loggerbestand om door te gaan.")
-        return
+        st.stop()
 
-    logger_separator, logger_decimal, logger_skip_rows = (
-        file_reading_controls("logger")
-    )
+    logger_bytes = logger_file.getvalue()
 
-    try:
-        logger_raw = read_tabular_file(
-            file_bytes=logger_file.getvalue(),
-            separator_option=logger_separator,
-            decimal_option=logger_decimal,
-            skip_rows=logger_skip_rows,
+    if len(logger_bytes) > MAX_FILE_SIZE_MB * 1024 * 1024:
+        st.error(
+            f"Het bestand is groter dan {MAX_FILE_SIZE_MB} MB."
         )
-    except ValueError as exc:
-        st.error(str(exc))
-        return
+        st.stop()
 
-    st.caption(
-        f"Loggerbestand ingelezen: {len(logger_raw):,} regels en "
-        f"{len(logger_raw.columns)} kolommen."
+    detected_kind, detected_encoding, confidence = detect_file_kind(
+        logger_bytes
     )
 
-    with st.expander("Voorbeeld loggerbestand", expanded=True):
-        st.dataframe(logger_raw.head(20), use_container_width=True)
-
-    st.subheader("Kolomkoppeling loggerbestand")
-
-    (
-        logger_date_column,
-        logger_time_column,
-        logger_datetime_format,
-        logger_day_first,
-        logger_timezone,
-    ) = datetime_mapping_controls(
-        dataframe=logger_raw,
-        prefix="logger",
-        default_timezone="Nederlandse lokale tijd",
+    kind_label = (
+        "Tekstbestand"
+        if detected_kind == "text"
+        else "Binair bestand"
     )
 
-    logger_columns = list(logger_raw.columns)
-
-    suggested_logger_value = detect_suggested_column(
-        logger_columns,
-        PRESSURE_COLUMN_HINTS,
+    st.info(
+        f"Automatische detectie: **{kind_label}** "
+        f"met betrouwbaarheid {confidence:.0%}."
     )
 
-    logger_value_column = st.selectbox(
-        "Kolom met loggerdruk of waterkolom",
-        options=logger_columns,
-        index=logger_columns.index(suggested_logger_value),
+    file_mode = st.radio(
+        "Verwerkingsmethode",
+        options=[
+            "Automatisch",
+            "Tekstbestand",
+            "Binair bestand met vaste records",
+        ],
+        horizontal=True,
     )
 
-    temperature_options = ["(geen temperatuurkolom)"] + logger_columns
-
-    suggested_temperature = detect_suggested_column(
-        logger_columns,
-        TEMPERATURE_COLUMN_HINTS,
-    )
-
-    temperature_index = (
-        temperature_options.index(suggested_temperature)
-        if suggested_temperature in temperature_options
-        else 0
-    )
-
-    temperature_column_selection = st.selectbox(
-        "Optionele watertemperatuurkolom",
-        options=temperature_options,
-        index=temperature_index,
-    )
-
-    temperature_column: str | None = temperature_column_selection
-
-    if temperature_column_selection == "(geen temperatuurkolom)":
-        temperature_column = None
-
-    if logger_mode == "absolute_pressure":
-        st.header("3. KNMI-luchtdrukbestand")
-
-        knmi_file = st.file_uploader(
-            "Upload het lokale KNMI-bestand",
-            type=["dat", "csv", "txt"],
-            key="knmi_file",
+    if file_mode == "Automatisch":
+        effective_mode = (
+            "Tekstbestand"
+            if detected_kind == "text"
+            else "Binair bestand met vaste records"
         )
+    else:
+        effective_mode = file_mode
 
-        if knmi_file is None:
-            st.info(
-                "Upload een KNMI-bestand met datum, tijd en luchtdruk."
-            )
-            return
+    logger_data: pd.DataFrame | None = None
 
-        knmi_separator, knmi_decimal, knmi_skip_rows = (
-            file_reading_controls("knmi")
+    if effective_mode == "Tekstbestand":
+        separator, decimal, header_row = render_text_table_settings(
+            "logger"
         )
 
         try:
-            knmi_raw = read_tabular_file(
-                file_bytes=knmi_file.getvalue(),
-                separator_option=knmi_separator,
-                decimal_option=knmi_decimal,
-                skip_rows=knmi_skip_rows,
+            logger_raw = read_text_table(
+                file_bytes=logger_bytes,
+                encoding=detected_encoding,
+                separator_name=separator,
+                decimal=decimal,
+                header_row=header_row,
             )
         except ValueError as exc:
             st.error(str(exc))
-            return
+            st.stop()
 
-        st.caption(
-            f"KNMI-bestand ingelezen: {len(knmi_raw):,} regels en "
-            f"{len(knmi_raw.columns)} kolommen."
+        st.dataframe(
+            logger_raw.head(20),
+            use_container_width=True,
         )
 
-        with st.expander("Voorbeeld KNMI-bestand", expanded=True):
-            st.dataframe(knmi_raw.head(20), use_container_width=True)
+        text_columns = list(logger_raw.columns)
 
-        st.subheader("Kolomkoppeling KNMI-bestand")
+        mapping_columns = st.columns(4)
 
-        (
-            knmi_date_column,
-            knmi_time_column,
-            knmi_datetime_format,
-            knmi_day_first,
-            knmi_timezone,
-        ) = datetime_mapping_controls(
-            dataframe=knmi_raw,
-            prefix="knmi",
-            default_timezone="UTC",
+        date_column = mapping_columns[0].selectbox(
+            "Datum- of tijdkolom",
+            options=text_columns,
+        )
+
+        time_selection = mapping_columns[1].selectbox(
+            "Aparte tijdkolom",
+            options=["Geen"] + text_columns,
+        )
+
+        value_column = mapping_columns[2].selectbox(
+            "Loggerwaarde",
+            options=text_columns,
+        )
+
+        temperature_selection = mapping_columns[3].selectbox(
+            "Temperatuurkolom",
+            options=["Geen"] + text_columns,
+        )
+
+        logger_timezone = render_timezone_selector(
+            "logger_text_timezone",
+            "Nederlandse lokale tijd",
+        )
+
+        day_first = st.checkbox(
+            "Datum gebruikt dag-maand-jaar",
+            value=True,
+        )
+
+        try:
+            logger_data = prepare_text_logger(
+                dataframe=logger_raw,
+                date_column=date_column,
+                time_column=(
+                    None
+                    if time_selection == "Geen"
+                    else time_selection
+                ),
+                value_column=value_column,
+                temperature_column=(
+                    None
+                    if temperature_selection == "Geen"
+                    else temperature_selection
+                ),
+                timezone_mode=logger_timezone,
+                day_first=day_first,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+
+    else:
+        binary_configuration = render_binary_configuration(
+            logger_bytes
+        )
+
+        logger_timezone = render_timezone_selector(
+            "logger_binary_timezone",
+            "Nederlandse lokale tijd",
+        )
+
+        if st.button(
+            "Test binaire decoder",
+            use_container_width=True,
+        ):
+            try:
+                preview_data = decode_binary_logger(
+                    logger_bytes,
+                    binary_configuration,
+                    maximum_records=100,
+                )
+
+                st.success(
+                    "De eerste binaire records zijn gedecodeerd."
+                )
+
+                st.dataframe(
+                    preview_data,
+                    use_container_width=True,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+
+        try:
+            decoded_binary = decode_binary_logger(
+                logger_bytes,
+                binary_configuration,
+            )
+
+            logger_data = prepare_binary_logger(
+                decoded_binary,
+                logger_timezone,
+            )
+
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+
+    if logger_data is None or logger_data.empty:
+        st.error("Er zijn geen loggergegevens beschikbaar.")
+        st.stop()
+
+    st.subheader("Preview genormaliseerde loggerdata")
+
+    st.dataframe(
+        logger_data.head(50),
+        use_container_width=True,
+    )
+
+    if logger_data["tijd"].notna().any():
+        st.caption(
+            "Periode logger: "
+            f"{logger_data['tijd'].min():%d-%m-%Y %H:%M:%S} tot "
+            f"{logger_data['tijd'].max():%d-%m-%Y %H:%M:%S}"
+        )
+
+    if logger_mode == "absolute_pressure":
+        st.header("3. KNMI-luchtdruk")
+
+        knmi_file = st.file_uploader(
+            "Upload KNMI-bestand",
+            type=["dat", "csv", "txt"],
+        )
+
+        if knmi_file is None:
+            st.stop()
+
+        knmi_bytes = knmi_file.getvalue()
+        knmi_kind, knmi_encoding, _ = detect_file_kind(knmi_bytes)
+
+        if knmi_kind != "text":
+            st.error(
+                "Het KNMI-bestand moet een tekstueel tabelbestand zijn."
+            )
+            st.stop()
+
+        knmi_separator, knmi_decimal, knmi_header = (
+            render_text_table_settings("knmi")
+        )
+
+        try:
+            knmi_raw = read_text_table(
+                file_bytes=knmi_bytes,
+                encoding=knmi_encoding,
+                separator_name=knmi_separator,
+                decimal=knmi_decimal,
+                header_row=knmi_header,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+
+        st.dataframe(
+            knmi_raw.head(20),
+            use_container_width=True,
         )
 
         knmi_columns = list(knmi_raw.columns)
+        knmi_mapping = st.columns(3)
 
-        suggested_knmi_pressure = detect_suggested_column(
-            knmi_columns,
-            PRESSURE_COLUMN_HINTS,
+        knmi_date_column = knmi_mapping[0].selectbox(
+            "KNMI datum- of tijdkolom",
+            options=knmi_columns,
         )
 
-        knmi_pressure_column = st.selectbox(
-            "Kolom met KNMI-luchtdruk",
+        knmi_time_selection = knmi_mapping[1].selectbox(
+            "KNMI aparte tijdkolom",
+            options=["Geen"] + knmi_columns,
+        )
+
+        knmi_pressure_column = knmi_mapping[2].selectbox(
+            "KNMI-luchtdrukkrom",
             options=knmi_columns,
-            index=knmi_columns.index(suggested_knmi_pressure),
+        )
+
+        knmi_timezone = render_timezone_selector(
+            "knmi_timezone",
+            "UTC",
+        )
+
+        knmi_day_first = st.checkbox(
+            "KNMI-datum gebruikt dag-maand-jaar",
+            value=True,
         )
 
         maximum_gap_hours = st.number_input(
-            "Maximaal KNMI-datagat voor interpolatie (uur)",
+            "Maximaal te interpoleren KNMI-datagat in uren",
             min_value=1.0,
             max_value=168.0,
             value=6.0,
             step=1.0,
-            help=(
-                "Loggerwaarden worden niet berekend als de omliggende "
-                "KNMI-metingen verder uit elkaar liggen dan deze grens."
-            ),
         )
 
+        try:
+            knmi_data = prepare_knmi_data(
+                dataframe=knmi_raw,
+                date_column=knmi_date_column,
+                time_column=(
+                    None
+                    if knmi_time_selection == "Geen"
+                    else knmi_time_selection
+                ),
+                pressure_column=knmi_pressure_column,
+                timezone_mode=knmi_timezone,
+                day_first=knmi_day_first,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+
     else:
-        knmi_raw = pd.DataFrame()
-        knmi_date_column = ""
-        knmi_time_column = None
-        knmi_datetime_format = None
-        knmi_day_first = True
-        knmi_timezone = "Geen tijdzonecorrectie"
-        knmi_pressure_column = ""
+        knmi_data = pd.DataFrame()
         maximum_gap_hours = 6.0
 
     st.header("4. Berekening")
@@ -1555,146 +1993,110 @@ def main() -> None:
         type="primary",
         use_container_width=True,
     ):
-        return
+        st.stop()
 
     configuration = PeilfilterConfiguration(
         filter_id=filter_id.strip() or "Onbekend",
         top_casing_nap_m=float(top_casing_nap_m),
         cable_length_m=float(cable_length_m),
         logger_mode=logger_mode,
-        logger_pressure_unit=logger_pressure_unit,
-        knmi_pressure_unit=knmi_pressure_unit,
-        water_column_unit=water_column_unit,
-        default_water_temperature_c=float(default_temperature_c),
+        logger_unit=logger_unit,
+        knmi_pressure_unit=knmi_unit,
+        default_temperature_c=float(default_temperature),
         use_temperature_density=use_temperature_density,
     )
 
     try:
-        with st.spinner("Gegevens verwerken en waterstanden berekenen..."):
-            logger_data = prepare_logger_data(
-                dataframe=logger_raw,
-                date_column=logger_date_column,
-                time_column=logger_time_column,
-                value_column=logger_value_column,
-                temperature_column=temperature_column,
-                datetime_format=logger_datetime_format,
-                day_first=logger_day_first,
-                timezone_mode=logger_timezone,
-            )
-
-            if logger_mode == "absolute_pressure":
-                knmi_data = prepare_knmi_data(
-                    dataframe=knmi_raw,
-                    date_column=knmi_date_column,
-                    time_column=knmi_time_column,
-                    pressure_column=knmi_pressure_column,
-                    datetime_format=knmi_datetime_format,
-                    day_first=knmi_day_first,
-                    timezone_mode=knmi_timezone,
-                )
-
-                combined_data = interpolate_knmi_pressure(
-                    logger_data=logger_data,
-                    knmi_data=knmi_data,
-                    knmi_pressure_unit=knmi_pressure_unit,
-                    maximum_gap_hours=float(maximum_gap_hours),
-                )
-            else:
-                combined_data = logger_data.copy()
-                combined_data["luchtdruk_pa"] = np.nan
-                combined_data["knmi_broninterval_uur"] = np.nan
-                combined_data["buiten_knmi_periode"] = False
-
-            result = calculate_groundwater_levels(
-                combined_data=combined_data,
-                configuration=configuration,
-            )
-
-    except ValueError as exc:
-        LOGGER.exception("Validatiefout tijdens verwerking")
-        st.error(str(exc))
-        return
-    except Exception as exc:
-        LOGGER.exception("Onverwachte fout tijdens verwerking")
-        st.error(
-            "Er is een onverwachte fout opgetreden bij de berekening: "
-            f"{exc}"
-        )
-        return
-
-    st.success("De waterstanden zijn berekend.")
-
-    summary = summarize_quality(result)
-    show_quality_summary(summary)
-
-    valid_results = result.dropna(subset=["waterstand_nap_m"])
-
-    if not valid_results.empty:
-        metric_columns = st.columns(4)
-
-        metric_columns[0].metric(
-            "Minimum",
-            f"{valid_results['waterstand_nap_m'].min():.3f} m NAP",
-        )
-        metric_columns[1].metric(
-            "Gemiddelde",
-            f"{valid_results['waterstand_nap_m'].mean():.3f} m NAP",
-        )
-        metric_columns[2].metric(
-            "Maximum",
-            f"{valid_results['waterstand_nap_m'].max():.3f} m NAP",
-        )
-        metric_columns[3].metric(
-            "Meetperiode",
-            (
-                f"{valid_results['tijd'].min():%d-%m-%Y} t/m "
-                f"{valid_results['tijd'].max():%d-%m-%Y}"
-            ),
-        )
-
-        st.plotly_chart(
-            create_water_level_figure(result),
-            use_container_width=True,
-        )
-
         if logger_mode == "absolute_pressure":
-            st.plotly_chart(
-                create_pressure_figure(result),
-                use_container_width=True,
+            combined = interpolate_knmi_pressure(
+                logger_data=logger_data,
+                knmi_data=knmi_data,
+                knmi_pressure_unit=knmi_unit,
+                maximum_gap_hours=float(maximum_gap_hours),
             )
-    else:
-        st.error(
-            "Er zijn geen geldige waterstanden berekend. Controleer de "
-            "eenheden, tijdzones, KNMI-periode en kolomkoppelingen."
+        else:
+            combined = logger_data.copy()
+            combined["luchtdruk_pa"] = np.nan
+            combined["knmi_broninterval_uur"] = np.nan
+            combined["buiten_knmi_periode"] = False
+
+        result = calculate_water_levels(
+            combined,
+            configuration,
         )
 
-    st.subheader("Resultaten")
+    except Exception as exc:
+        LOGGER.exception("Berekening mislukt")
+        st.error(f"De berekening is mislukt: {exc}")
+        st.stop()
 
-    preferred_columns = [
-        "filter_id",
-        "tijd",
-        "loggerwaarde",
-        "loggerdruk_pa",
-        "luchtdruk_hpa",
-        "wateroverdruk_pa",
-        "gebruikte_temperatuur_c",
-        "waterdichtheid_kg_m3",
-        "waterkolom_m",
-        "sensorhoogte_nap_m",
-        "waterstand_nap_m",
-        "waterdiepte_tov_bovenkant_m",
-        "knmi_broninterval_uur",
-        "kwaliteitscode",
-    ]
+    valid = result.dropna(subset=["waterstand_nap_m"])
 
-    display_columns = [
+    if valid.empty:
+        st.error(
+            "Er zijn geen geldige waterstanden berekend. Controleer "
+            "vooral de binaire decoder, drukeenheden en tijdzones."
+        )
+        st.stop()
+
+    st.success(
+        f"{len(valid):,} geldige waterstanden berekend."
+    )
+
+    metrics = st.columns(4)
+
+    metrics[0].metric(
+        "Minimum",
+        f"{valid['waterstand_nap_m'].min():.3f} m NAP",
+    )
+
+    metrics[1].metric(
+        "Gemiddelde",
+        f"{valid['waterstand_nap_m'].mean():.3f} m NAP",
+    )
+
+    metrics[2].metric(
+        "Maximum",
+        f"{valid['waterstand_nap_m'].max():.3f} m NAP",
+    )
+
+    metrics[3].metric(
+        "Geldige records",
+        f"{len(valid):,}",
+    )
+
+    st.plotly_chart(
+        create_water_level_figure(result),
+        use_container_width=True,
+    )
+
+    output_columns = [
         column
-        for column in preferred_columns
+        for column in [
+            "filter_id",
+            "tijd",
+            "recordnummer",
+            "byte_offset",
+            "loggerwaarde",
+            "loggerdruk_pa",
+            "luchtdruk_hpa",
+            "wateroverdruk_pa",
+            "gebruikte_temperatuur_c",
+            "waterdichtheid_kg_m3",
+            "waterkolom_m",
+            "sensorhoogte_nap_m",
+            "waterstand_nap_m",
+            "waterdiepte_tov_bovenkant_m",
+            "knmi_broninterval_uur",
+            "buiten_knmi_periode",
+            "kwaliteitscode",
+            "decodeerfout",
+        ]
         if column in result.columns
     ]
 
     st.dataframe(
-        result[display_columns],
+        result[output_columns],
         use_container_width=True,
         hide_index=True,
     )
@@ -1703,31 +2105,16 @@ def main() -> None:
         r"[^A-Za-z0-9_-]+",
         "_",
         configuration.filter_id,
-    ).strip("_")
-
-    if not safe_filter_id:
-        safe_filter_id = "peilfilter"
+    ).strip("_") or "peilfilter"
 
     st.download_button(
-        label="Download resultaten als CSV",
-        data=dataframe_to_csv_bytes(result[display_columns]),
+        "Download berekende waterstanden",
+        data=dataframe_to_csv_bytes(result[output_columns]),
         file_name=f"{safe_filter_id}_waterstanden_nap.csv",
         mime="text/csv",
         type="primary",
         use_container_width=True,
     )
-
-    with st.expander("Betekenis kwaliteitscodes"):
-        st.markdown(
-            """
-            - **OK**: geldige berekening zonder automatische waarschuwing
-            - **L-MIS**: loggerwaarde ontbreekt
-            - **K-MIS**: geen bruikbare KNMI-luchtdruk beschikbaar
-            - **K-EXT**: logger-tijdstip ligt buiten de KNMI-periode
-            - **NEG**: berekende waterkolom is negatief
-            - **RANGE**: waterkolom ligt buiten de standaard plausibiliteitsgrens
-            """
-        )
 
 
 if __name__ == "__main__":
