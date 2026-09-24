@@ -1006,7 +1006,7 @@ def interpolate_knmi_pressure(
         logger_time = logger_times[index]
 
         if position == 0:
-            if logger_time == knmi_timesinterpolated[index] = pressures[0]
+            if logger_time == knmi_times_ns[0]:
                 source_intervals[index] = 0.0
             else:
                 outside_range[index] = True
