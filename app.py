@@ -769,7 +769,7 @@ def interpolate_knmi_pressure(
         logger_time = logger_times_ns[index]
 
         if position == 0:
-            if logger_time == knmi_times_nsinterpolated[index] = pressure_values[0]
+            if logger_time == knmi_times_ns[0]:
                 source_gap_hours[index] = 0.0
             else:
                 is_outside_range[index] = True
