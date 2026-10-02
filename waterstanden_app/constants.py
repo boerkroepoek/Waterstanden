@@ -5,7 +5,7 @@ APP_TITLE: Final = "Waterstanden naar NAP"
 GRAVITY_M_S2: Final = 9.80665
 DEFAULT_WATER_DENSITY_KG_M3: Final = 998.2
 MAX_FILE_SIZE_MB: Final = 200
-NANOSECONDS_PER_HOUR: Final = 3_600_000_000_000
+NANOSECONDS_PER_HOUR: Final = 3_600_000_000
 LOGGER_MODES: Final = {"Absolute druk": "absolute_pressure", "Waterkolom": "water_column"}
 PRESSURE_UNIT_FACTORS_TO_PA: Final = {
     "Pa": 1.0, "hPa": 100.0, "mbar": 100.0, "0,1 hPa": 10.0,

@@ -59,6 +59,27 @@ def interpolate_knmi_pressure(logger_data: pd.DataFrame, knmi_data: pd.DataFrame
     logger["luchtdruk_pa"] = interpolated; logger["knmi_broninterval_uur"] = intervals; logger["buiten_knmi_periode"] = outside
     return logger
 
+def exclude_time_periods(dataframe: pd.DataFrame, periods: list[tuple[pd.Timestamp | str, pd.Timestamp | str]] | None = None) -> pd.DataFrame:
+    """Verwijder een of meerdere periodes uit de analyse."""
+    result = dataframe.copy()
+    if result.empty:
+        return result
+    if periods is None:
+        return result
+    mask = pd.Series(True, index=result.index)
+    for start, end in periods:
+        if start is None or end is None:
+            continue
+        period_start = pd.Timestamp(start)
+        period_end = pd.Timestamp(end)
+        if pd.isna(period_start) or pd.isna(period_end):
+            continue
+        if period_start > period_end:
+            period_start, period_end = period_end, period_start
+        mask &= ~((result["tijd"] >= period_start) & (result["tijd"] <= period_end))
+    return result.loc[mask].copy().reset_index(drop=True)
+
+
 def calculate_water_levels(dataframe: pd.DataFrame, configuration: PeilfilterConfiguration) -> pd.DataFrame:
     """Bereken waterkolom, NAP-waterstand en kwaliteitsvlaggen."""
     result = dataframe.copy()

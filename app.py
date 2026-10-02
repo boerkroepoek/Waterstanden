@@ -5,7 +5,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 from waterstanden_app.binary import create_hex_preview, decode_binary_logger
-from waterstanden_app.calculations import calculate_water_levels, interpolate_knmi_pressure
+from waterstanden_app.calculations import calculate_water_levels, exclude_time_periods, interpolate_knmi_pressure
 from waterstanden_app.constants import APP_TITLE, BINARY_VALUE_FORMATS, LENGTH_UNIT_FACTORS_TO_M, LOGGER_MODES, MAX_FILE_SIZE_MB, PRESSURE_UNIT_FACTORS_TO_PA
 from waterstanden_app.export import create_water_level_figure, dataframe_to_csv_bytes
 from waterstanden_app.models import BinaryDecoderConfiguration, BinaryFieldDefinition, PeilfilterConfiguration, TimezoneMode
@@ -124,13 +124,50 @@ def main() -> None:
         result = calculate_water_levels(combined, configuration)
     except (ValueError, TypeError, KeyError) as exc:
         LOGGER.exception("Berekening mislukt"); st.error(f"De berekening is mislukt: {exc}"); st.stop()
-    valid = result.dropna(subset=["waterstand_nap_m"])
-    if valid.empty: st.error("Er zijn geen geldige waterstanden berekend."); st.stop()
+    excluded_periods = st.session_state.get("excluded_periods", [])
+    if not excluded_periods:
+        working = result.copy()
+    else:
+        working = exclude_time_periods(result, excluded_periods)
+    valid = working.dropna(subset=["waterstand_nap_m"])
+    if valid.empty: st.error("Er zijn geen geldige waterstanden berekend na het verwijderen van de geselecteerde periodes."); st.stop()
+    st.subheader("5. Periodes buiten beschouwing")
+    with st.form("exclude_periods_form"):
+        c = st.columns(2)
+        start = c[0].datetime_input("Start van periode", value=result["tijd"].min().to_pydatetime() if not result.empty else datetime.now())
+        end = c[1].datetime_input("Einde van periode", value=result["tijd"].max().to_pydatetime() if not result.empty else datetime.now())
+        submitted = st.form_submit_button("Periode toevoegen")
+        if submitted:
+            if start <= end:
+                excluded_periods.append((pd.Timestamp(start), pd.Timestamp(end)))
+                st.session_state["excluded_periods"] = excluded_periods
+                st.rerun()
+            else:
+                st.warning("De starttijd moet vóór of gelijk aan de eindtijd liggen.")
+    selection = st.plotly_chart(create_water_level_figure(working), on_select="rerun", selection_mode="x", use_container_width=True)
+    if isinstance(selection, dict):
+        points = selection.get("selection", {}).get("points", [])
+        x_values = [point.get("x") for point in points if isinstance(point.get("x"), (str, datetime, pd.Timestamp))]
+        if x_values:
+            selected_start = min(pd.to_datetime(x_values))
+            selected_end = max(pd.to_datetime(x_values))
+            st.caption(f"Geselecteerd in grafiek: {selected_start:%d-%m-%Y %H:%M} tot {selected_end:%d-%m-%Y %H:%M}")
+            if st.button("Gebruik geselecteerde grafiekperiode"):
+                excluded_periods.append((selected_start, selected_end))
+                st.session_state["excluded_periods"] = excluded_periods
+                st.rerun()
+    if excluded_periods:
+        period_df = pd.DataFrame([(pd.Timestamp(start), pd.Timestamp(end)) for start, end in excluded_periods], columns=["Start", "Einde"])
+        st.dataframe(period_df, use_container_width=True, hide_index=True)
+        if st.button("Laatste periode verwijderen"):
+            excluded_periods.pop()
+            st.session_state["excluded_periods"] = excluded_periods
+            st.rerun()
     c = st.columns(4); c[0].metric("Minimum", f"{valid['waterstand_nap_m'].min():.3f} m NAP"); c[1].metric("Gemiddelde", f"{valid['waterstand_nap_m'].mean():.3f} m NAP"); c[2].metric("Maximum", f"{valid['waterstand_nap_m'].max():.3f} m NAP"); c[3].metric("Geldige records", f"{len(valid):,}")
-    st.plotly_chart(create_water_level_figure(result), use_container_width=True)
-    st.dataframe(result, use_container_width=True, hide_index=True)
+    st.plotly_chart(create_water_level_figure(working), use_container_width=True)
+    st.dataframe(working, use_container_width=True, hide_index=True)
     safe_id = re.sub(r"[^A-Za-z0-9_-]+", "_", configuration.filter_id).strip("_") or "peilfilter"
-    st.download_button("Download berekende waterstanden", dataframe_to_csv_bytes(result), f"{safe_id}_waterstanden_nap.csv", "text/csv", type="primary", use_container_width=True)
+    st.download_button("Download berekende waterstanden", dataframe_to_csv_bytes(working), f"{safe_id}_waterstanden_nap.csv", "text/csv", type="primary", use_container_width=True)
 
 if __name__ == "__main__":
     main()
