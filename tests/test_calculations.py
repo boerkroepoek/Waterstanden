@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 import pytest
-from waterstanden_app.calculations import calculate_water_levels, interpolate_knmi_pressure
+from waterstanden_app.calculations import calculate_water_levels, exclude_time_periods, interpolate_knmi_pressure
 from waterstanden_app.models import PeilfilterConfiguration
 
 def test_exact_first_knmi_measurement_regression() -> None:
@@ -19,6 +19,14 @@ def test_interpolation_and_large_gap() -> None:
     knmi = pd.DataFrame({"tijd": pd.to_datetime(["2026-01-01 00:00", "2026-01-01 01:00"]), "knmi_druk_bronwaarde": [1000.0, 1002.0]})
     assert interpolate_knmi_pressure(logger, knmi, "hPa", 6.0).loc[0, "luchtdruk_pa"] == pytest.approx(100_100.0)
     assert np.isnan(interpolate_knmi_pressure(logger, knmi, "hPa", 0.25).loc[0, "luchtdruk_pa"])
+
+def test_exclude_time_periods_removes_requested_ranges() -> None:
+    """Laat één of meerdere periodes buiten de analyse vallen."""
+    data = pd.DataFrame({"tijd": pd.to_datetime(["2026-01-01 00:00", "2026-01-01 00:30", "2026-01-01 01:00", "2026-01-01 01:30"]), "waterstand_nap_m": [1.0, 2.0, 3.0, 4.0]})
+    filtered = exclude_time_periods(data, [(pd.Timestamp("2026-01-01 00:15"), pd.Timestamp("2026-01-01 01:15"))])
+    assert filtered["tijd"].tolist() == [pd.Timestamp("2026-01-01 00:00"), pd.Timestamp("2026-01-01 01:30")]
+    assert filtered["waterstand_nap_m"].tolist() == [1.0, 4.0]
+
 
 def test_water_column_level_and_quality_codes() -> None:
     """Bereken waterstand en behoud meerdere kwaliteitscodes."""
